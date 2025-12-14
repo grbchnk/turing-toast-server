@@ -358,6 +358,33 @@ function calculateAndShowResults(roomId) {
     });
 }
 
+// --- ДИАГНОСТИКА: ПРОВЕРКА МОДЕЛЕЙ ---
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+async function listModels() {
+  try {
+    console.log("🔍 Запрашиваю список доступных моделей...");
+    // Получаем только модели, которые поддерживают генерацию текста (generateContent)
+    const models = await genAI.listModels();
+    
+    console.log("✅ ДОСТУПНЫЕ МОДЕЛИ:");
+    let found = false;
+    for await (const model of models) {
+      if (model.supportedGenerationMethods.includes("generateContent")) {
+        console.log(`👉 ${model.name}`);
+        found = true;
+      }
+    }
+    if (!found) console.log("⚠️ Нет доступных моделей для генерации текста.");
+  } catch (error) {
+    console.error("❌ Ошибка при проверке моделей:", error.message);
+  }
+}
+
+listModels();
+// -------------------------------------
+
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`🚀 Server running on ${PORT}`);
