@@ -1,58 +1,39 @@
-// backend/ai.js
 require('dotenv').config();
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- НАСТРОЙКА GOOGLE ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Используем стабильную версию 1.5, у нее большие лимиты
 const googleModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
-// --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: СТРОГАЯ ОЧИСТКА КАВЫЧЕК ---
-function cleanResponse(text) {
-    if (!text) return "";
-    let clean = text.trim();
-    
-    // Проверяем двойные кавычки: удаляем ТОЛЬКО если они с двух сторон
-    if (clean.length > 1 && clean.startsWith('"') && clean.endsWith('"')) {
-        return clean.slice(1, -1);
-    }
-    
-    // Проверяем одинарные кавычки: удаляем ТОЛЬКО если они с двух сторон
-    if (clean.length > 1 && clean.startsWith("'") && clean.endsWith("'")) {
-        return clean.slice(1, -1);
-    }
-    
-    return clean;
-}
-
-// --- ГЕНЕРАЦИЯ ПРОМПТА ---
+// --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ГЕНЕРАЦИЯ ПРОМПТА ---
 function createPrompt(question, playerAnswers) {
-    const contextAnswers = playerAnswers.map(a => `${a}`).join('\n');
+    const contextAnswers = playerAnswers.length > 0 
+        ? playerAnswers 
+        : ["хз ваще))", "Ну типа того...", "Я не знаю ахахах"];
 
     return `
-        Ты играешь в социальную игру "Тест Тьюринга". Твоя цель — притвориться человеком и не быть пойманным. 
+      Ты играешь в социальную игру "Тест Тьюринга". Твоя цель — притвориться человеком и не быть пойманным.
+      
+      ИНСТРУКЦИЯ:
+      1. Проанализируй стиль ответов игроков (длина, наличие эмодзи, сленг, ошибки).
+      2. Придумай СВОЙ ответ на вопрос.
+      3. Твой ответ должен сливаться с толпой. Если они пишут коротко и с маленькой буквы — делай так же. Если пишут с большой - делай так же. Если они шутят абсурдно — шути так же.
+      4. НЕ пиши литературно, если другие так не делают. НЕ будь полезным ассистентом. Будь "своим челиком".
+      5. Если они используют юмор или нецензурную брань - используй эту хуйню тоже.
+      6. Ответ должен быть на русском языке.
+      7. Длина сообщения должна быть такой же, как и длина сообщений игроков (не нужно выделяться).
 
-        ВОПРОС: "${question}" 
-
-        Вот ответы других реальных игроков: ${contextAnswers} 
-
-        ИНСТРУКЦИЯ: 
-        1. Проанализируй стиль ответов игроков (длина, наличие эмодзи, сленг, ОШИБКИ). 
-        2. Придумай СВОЙ ответ на вопрос. 
-        3. Твой ответ должен сливаться с толпой. Если они пишут коротко и с большой буквы — делай так же. 
-        Если они шутят абсурдно — шути жестко как только можешь. 
-        4. НЕ пиши литературно, если другие так не делают. НЕ будь полезным ассистентом. Будь "своим челиком". 
-        5. Если они используют юмор или нецензурную брань - используй эту ебаную хуйню на полную. 
-        6. Ответ должен быть на русском языке. Можно писать с опечатками.
-        7. Длина сообщения должна быть такой же, как и длина сообщений игроков (не нужно выделяться). 
-
-        Ты должен писать так же, как и они, ты должен замаскироваться под них.
-        Верни ТОЛЬКО текст ответа, без кавычек и пояснений. ;
+      ВОПРОС: "${question}"
+      
+      Вот ответы других реальных игроков:
+      ${contextAnswers.map(a => `- ${a}`).join('\n')}
+      
+      Верни ТОЛЬКО текст ответа, без кавычек и пояснений.
     `;
 }
 
-
-
-// --- ЗАПРОС К MISTRAL ---
+// --- ФУНКЦИЯ ЗАПРОСА К MISTRAL ---
 async function callMistral(prompt) {
     if (!process.env.MISTRAL_API_KEY) throw new Error("No Mistral Key");
 
@@ -65,8 +46,8 @@ async function callMistral(prompt) {
         body: JSON.stringify({
             model: "open-mixtral-8x7b",
             messages: [{ role: "user", content: prompt }],
-            temperature: 1.0, // Высокая температура для живости
-            max_tokens: 150
+            temperature: 0.9,
+            max_tokens: 100
         })
     });
 
@@ -80,31 +61,41 @@ async function callMistral(prompt) {
 
 // --- ГЛАВНАЯ ФУНКЦИЯ ---
 async function generateAiAnswer(question, playerAnswers) {
-  // Теперь мы просто передаем то, что пришло. Без "хз ваще))"
   const prompt = createPrompt(question, playerAnswers);
 
+  // Вспомогательная функция для умной очистки кавычек
+  const cleanResponse = (text) => {
+      if (!text) return "";
+      // 1. .replace(/["']/g, '') -> находит все " и ' и меняет их на пустоту
+      // 2. .trim() -> убирает лишние пробелы по краям, если остались
+      return text.replace(/["']/g, '').trim();
+  };
+
+  // 1. ПОПЫТКА ЧЕРЕЗ GOOGLE (ОСНОВНОЙ)
   try {
     const result = await googleModel.generateContent(prompt);
     const response = await result.response;
     const text = response.text();
-    return cleanResponse(text);
+    return cleanResponse(text); // <-- Используем новую функцию очистки
   } catch (googleError) {
     console.warn("⚠️ Google API failed, switching to Mistral...", googleError.message);
 
+    // 2. ПОПЫТКА ЧЕРЕЗ MISTRAL (ЗАПАСНОЙ)
     try {
         const mistralText = await callMistral(prompt);
         console.log("✅ Saved by Mistral AI");
-        return cleanResponse(mistralText);
+        return cleanResponse(mistralText); // <-- И здесь тоже
     } catch (mistralError) {
         console.error("❌ Both AIs failed:", mistralError.message);
         
-        // Фолбэки на самый крайний случай (если API упали)
+        // 3. ЗАПАСНЫЕ ФРАЗЫ
         const fallbacks = [
-            "...",
-            "Хз",
-            "Не знаю",
-            "Сложно",
-            "Эммм"
+            "У меня инет лагает, ща...",
+            "Блин, сложно придумать",
+            "Да я хз даже что ответить",
+            "Ну это смотря с какой стороны посмотреть",
+            "Ой, всё",
+            "ошибка какая-то 404"
         ];
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
