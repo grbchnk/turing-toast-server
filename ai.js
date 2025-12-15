@@ -28,7 +28,7 @@ function cleanResponse(text) {
 function createPrompt(question, playerAnswers) {
     // 1. Убрали заглушки. Теперь используем только реальные ответы.
     // Если массив пустой (чего быть не должно по твоим словам), будет пустая строка.
-    const contextList = playerAnswers.map(a => `- ${a}`).join('\n');
+    const contextAnswers = playerAnswers.map(a => `- ${a}`).join('\n');
 
     return `
         Ты играешь в игру "Тест Тьюринга". Твоя задача — притворяться обычным человеком, чтобы тебя не раскрыли как ИИ.
