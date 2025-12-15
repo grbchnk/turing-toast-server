@@ -79,6 +79,34 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('update_players', room.players);
   });
 
+  socket.on('update_profile', async ({ name }) => {
+    if (!name || !socket.user) return;
+
+    // 1. Обновляем Supabase
+    const { error } = await supabase
+        .from('users')
+        .update({ first_name: name })
+        .eq('id', socket.user.id);
+
+    if (error) {
+        console.error('Supabase Error:', error);
+        return socket.emit('error', 'Не удалось обновить имя');
+    }
+
+    // 2. Обновляем локальный объект сокета
+    socket.user.name = name;
+
+    // 3. Обновляем всех игроков в комнатах, где этот игрок есть
+    Object.values(rooms).forEach(room => {
+        const player = room.players.find(p => p.id === socket.user.id);
+        if (player) {
+        player.name = name;
+        io.to(room.id).emit('update_players', room.players);
+        }
+    });
+    });
+
+
   socket.on('get_topics', () => {
       const list = Object.keys(TOPICS).map(key => ({
           id: key,
