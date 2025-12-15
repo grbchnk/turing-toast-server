@@ -192,13 +192,18 @@ io.on('connection', (socket) => {
       } else {
           // Если ушел ХОСТ -> передаем права следующему
           if (room.hostUserId === socket.user.id) {
-              const newHost = room.players[0];
-              room.hostUserId = newHost.id; // [FIX] Передаем User ID
-              room.hostId = newHost.socketId; // Передаем Socket ID
-              // Можно отправить событие new_host, если нужно обновить UI у других
+              const newHost = room.players[0]; // Берем первого попавшегося (обычно следующий по списку)
+              room.hostUserId = newHost.id; 
+              room.hostId = newHost.socketId; 
+              
+              console.log(`Права хоста переданы игроку ${newHost.name} (ID: ${newHost.id})`);
+              
+              // --- [ВАЖНО] Сообщаем всем, кто теперь новый хост ---
+              io.to(roomId).emit('host_transferred', { newHostId: newHost.id });
           }
           io.to(roomId).emit('update_players', room.players);
       }
+  });
   });
 
   socket.on('create_room', () => {
@@ -398,12 +403,15 @@ socket.on('send_reaction', ({ roomId, emoji }) => {
       }
   });
   
-  socket.on('request_game_state', ({ roomId }) => {
+socket.on('request_game_state', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return;
 
+    // 1. Сначала обновляем список игроков и фазу
     socket.emit('update_players', room.players);
+    socket.emit('phase_change', room.state);
 
+    // 2. В зависимости от фазы отправляем актуальные данные
     if (room.state === 'writing') {
         socket.emit('new_round', {
             round: room.round,
@@ -414,19 +422,36 @@ socket.on('send_reaction', ({ roomId, emoji }) => {
             endTime: room.endTime,
             duration: room.timerDuration
         });
-    } else if (room.state === 'voting') {
-        const shuffled = [...room.answers]
-            .map(a => ({ id: a.id, text: a.text }))
-            .sort(() => 0.5 - Math.random());
-        socket.emit('start_voting', {
-            answers: shuffled,
-            endTime: room.endTime,
-            duration: 60
-        });
+        
+        // Если игрок уже отправил ответ, сообщаем ему об этом (чтобы скрыть поле ввода)
+        const hasAnswered = room.answers.some(a => a.authorId === socket.user.id);
+        if (hasAnswered) {
+             socket.emit('player_submitted', socket.user.id);
+        }
+    } 
+    else if (room.state === 'voting') {
+        // Отдаем сохраненные перемешанные ответы
+        if (room.currentShuffledAnswers) {
+            socket.emit('start_voting', {
+                answers: room.currentShuffledAnswers,
+                endTime: room.endTime,
+                duration: 60
+            });
+        }
+        
+        // Если игрок уже проголосовал
+        if (room.votes[socket.user.id]) {
+            socket.emit('player_voted', socket.user.id); // Это может потребоваться обработать на клиенте, если нужно блокировать UI
+        }
     }
-    socket.emit('phase_change', room.state);
+    else if (room.state === 'reveal') {
+        // Отдаем сохраненные результаты
+        if (room.lastRoundResults) {
+            socket.emit('round_results', room.lastRoundResults);
+        }
+    }
+    // Для 'ai_processing' ничего слать не нужно, клиент просто показывает лоадер по phase_change
   });
-});
 
 // --- GAME LOGIC FUNCTIONS ---
 function startNewRound(roomId) {
@@ -492,6 +517,8 @@ function startVotingPhase(roomId) {
     const shuffled = [...room.answers]
         .map(a => ({ id: a.id, text: a.text }))
         .sort(() => 0.5 - Math.random());
+    
+    room.currentShuffledAnswers = shuffled;
 
     room.endTime = Date.now() + 60000;
 
@@ -574,12 +601,15 @@ function calculateAndShowResults(roomId) {
 
     room.history.push(roundStats);
 
-    io.to(roomId).emit('round_results', {
+    // [FIX] Сохраняем результаты, чтобы отдать реконнектнувшимся
+    room.lastRoundResults = {
         deltas: deltas,
         votes: votesSummary,
         fullAnswers: room.answers,
         players: room.players
-    });
+    };
+
+    io.to(roomId).emit('round_results', room.lastRoundResults);
 }
 
 function finishGame(roomId) {
