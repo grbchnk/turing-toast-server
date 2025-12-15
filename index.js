@@ -293,58 +293,90 @@ const verifyTelegramAuth = (initData) => {
 
 // MIDDLEWARE СОКЕТОВ (срабатывает при подключении)
 io.use(async (socket, next) => {
-    const initData = socket.handshake.auth.initData;
-    
-    // 1. Проверяем данные Telegram
-    const tgUser = verifyTelegramAuth(initData);
+  const initData = socket.handshake.auth.initData;
+  const tgUser = verifyTelegramAuth(initData);
 
-    if (tgUser) {
-        // 2. Сначала пробуем найти пользователя в базе
-        const { data: existingUser, error: fetchError } = await supabase
-            .from('users')
-            .select('*')
-            .eq('id', tgUser.id)
-            .single();
+  if (tgUser) {
+    try {
+      // Пытаемся получить существующую запись пользователя из Supabase
+      const { data: dbUser, error: selectError } = await supabase
+        .from('users')
+        .select('id, first_name, username, avatar_url')
+        .eq('id', String(tgUser.id))
+        .maybeSingle();
 
-        if (fetchError) console.error('Supabase fetch error:', fetchError);
+      if (selectError) console.error('Supabase select error:', selectError);
 
-        let userName = tgUser.first_name;
-        let avatarUrl = tgUser.photo_url;
+      if (dbUser) {
+        // Пользователь есть в БД — предпочитаем имя из БД (если оно есть),
+        // иначе берём имя из Telegram.
+        const name = dbUser.first_name || tgUser.first_name || tgUser.username || `tg_${tgUser.id}`;
+        const avatar = dbUser.avatar_url || tgUser.photo_url || null;
 
-        if (existingUser) {
-            // Если пользователь есть, берём имя из базы
-            userName = existingUser.first_name || tgUser.first_name;
-            avatarUrl = existingUser.avatar_url || tgUser.photo_url;
-        } else {
-            // Если пользователя нет — создаём нового
-            const { error: insertError } = await supabase
-                .from('users')
-                .insert({
-                    id: tgUser.id,
-                    first_name: tgUser.first_name,
-                    username: tgUser.username,
-                    avatar_url: tgUser.photo_url
-                });
-            if (insertError) console.error('Supabase insert error:', insertError);
-        }
+        // Обновляем актуальные поля (username/avatar) но не перезаписываем first_name, если он есть
+        const { error: updateError } = await supabase
+          .from('users')
+          .update({
+            username: tgUser.username || dbUser.username,
+            avatar_url: tgUser.photo_url || dbUser.avatar_url
+          })
+          .eq('id', String(tgUser.id));
 
-        // 3. Прикрепляем данные к сокету
+        if (updateError) console.error('Supabase update error:', updateError);
+
         socket.user = {
-            id: tgUser.id,
-            name: userName,
-            avatar: avatarUrl,
-            isGuest: false
+          id: String(tgUser.id),
+          name,
+          avatar,
+          isGuest: false
         };
-    } else {
-        // 4. Если данных нет — гостевой режим
+      } else {
+        // Пользователя нет в БД — создаём запись (upsert удобен для вставки)
+        const { error: upsertError } = await supabase
+          .from('users')
+          .upsert({
+            id: String(tgUser.id),
+            first_name: tgUser.first_name || tgUser.username,
+            username: tgUser.username,
+            avatar_url: tgUser.photo_url
+          });
+
+        if (upsertError) console.error('Supabase upsert error:', upsertError);
+
         socket.user = {
-            id: 'guest_' + Math.random().toString(36).substr(2, 9),
-            name: 'Guest',
-            isGuest: true
+          id: String(tgUser.id),
+          name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
+          avatar: tgUser.photo_url || null,
+          isGuest: false
         };
+      }
+    } catch (e) {
+      console.error('Error while reading/updating supabase user:', e);
+      // fallback — всё равно пускаем как телеграм-пользователя
+      socket.user = {
+        id: String(tgUser.id),
+        name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
+        avatar: tgUser.photo_url || null,
+        isGuest: false
+      };
     }
+  } else {
+    // Гость (тест в браузере)
+    socket.user = {
+      id: 'guest_' + Math.random().toString(36).substr(2, 9),
+      name: 'Guest',
+      isGuest: true
+    };
+  }
 
-    next();
+  // Отправляем клиенту профиль (чтобы клиент мог сразу обновить UI)
+  try {
+    socket.emit('profile', socket.user);
+  } catch (e) {
+    // ничего страшного, это вспомогательное событие
+  }
+
+  next();
 });
 
 function startNewRound(roomId) {
