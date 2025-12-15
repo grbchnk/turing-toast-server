@@ -5,8 +5,8 @@ const cors = require('cors');
 const TOPICS = require('./topics');
 require('dotenv').config();
 const { generateAiAnswer } = require('./ai');
-const crypto = require('crypto'); // Встроенная в Node.js библиотека
-const supabase = require('./supabase'); // Наш файл из шага 3
+const crypto = require('crypto');
+const supabase = require('./supabase');
 
 const app = express();
 app.use(cors());
@@ -18,18 +18,121 @@ const io = new Server(server, {
 
 const rooms = {}; 
 
+// --- ФУНКЦИЯ ВЕРИФИКАЦИИ (вынесена наверх, до middleware) ---
+const verifyTelegramAuth = (initData) => {
+    if (!initData) return null;
+    
+    const urlParams = new URLSearchParams(initData);
+    const hash = urlParams.get('hash');
+    urlParams.delete('hash');
+
+    const checkString = Array.from(urlParams.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([key, val]) => `${key}=${val}`)
+        .join('\n');
+
+    const secret = crypto.createHmac('sha256', 'WebAppData')
+        .update(process.env.TELEGRAM_BOT_TOKEN)
+        .digest();
+
+    const calculatedHash = crypto.createHmac('sha256', secret)
+        .update(checkString)
+        .digest('hex');
+
+    if (calculatedHash === hash) {
+        const userStr = urlParams.get('user');
+        return userStr ? JSON.parse(userStr) : null;
+    }
+    return null;
+};
+
+// --- MIDDLEWARE СОКЕТОВ ---
+io.use(async (socket, next) => {
+  const initData = socket.handshake.auth.initData;
+  const tgUser = verifyTelegramAuth(initData);
+
+  if (tgUser) {
+    try {
+      const { data: dbUser, error: selectError } = await supabase
+        .from('users')
+        .select('id, first_name, username, avatar_url')
+        .eq('id', String(tgUser.id))
+        .maybeSingle();
+
+      if (selectError) console.error('Supabase select error:', selectError);
+
+      if (dbUser) {
+        const name = dbUser.first_name || tgUser.first_name || tgUser.username || `tg_${tgUser.id}`;
+        const avatar = dbUser.avatar_url || tgUser.photo_url || null;
+
+        const { error: updateError } = await supabase
+          .from('users')
+          .update({
+            username: tgUser.username || dbUser.username,
+            avatar_url: tgUser.photo_url || dbUser.avatar_url
+          })
+          .eq('id', String(tgUser.id));
+
+        if (updateError) console.error('Supabase update error:', updateError);
+
+        socket.user = {
+          id: String(tgUser.id),
+          name,
+          avatar,
+          isGuest: false
+        };
+      } else {
+        const { error: upsertError } = await supabase
+          .from('users')
+          .upsert({
+            id: String(tgUser.id),
+            first_name: tgUser.first_name || tgUser.username,
+            username: tgUser.username,
+            avatar_url: tgUser.photo_url
+          });
+
+        if (upsertError) console.error('Supabase upsert error:', upsertError);
+
+        socket.user = {
+          id: String(tgUser.id),
+          name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
+          avatar: tgUser.photo_url || null,
+          isGuest: false
+        };
+      }
+    } catch (e) {
+      console.error('Error while reading/updating supabase user:', e);
+      socket.user = {
+        id: String(tgUser.id),
+        name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
+        avatar: tgUser.photo_url || null,
+        isGuest: false
+      };
+    }
+  } else {
+    socket.user = {
+      id: 'guest_' + Math.random().toString(36).substr(2, 9),
+      name: 'Guest',
+      isGuest: true
+    };
+  }
+
+  // Отправляем профиль клиенту
+  socket.emit('profile', socket.user);
+  next();
+});
+
+// --- SOCKET EVENTS ---
 io.on('connection', (socket) => {
   console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
-  // --- ЛОББИ ---
   socket.on('create_room', () => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
     
-    // Формируем объект игрока из проверенных данных сокета
     const hostPlayer = {
         id: socket.user.id,
         name: socket.user.name,
-        avatar: socket.user.avatar, // Если сохранял URL фото
+        avatar: socket.user.avatar,
         socketId: socket.id,
         score: 0
     };
@@ -37,7 +140,7 @@ io.on('connection', (socket) => {
     rooms[roomId] = {
       id: roomId,
       hostId: socket.id,
-      players: [hostPlayer], // <--- Используем hostPlayer
+      players: [hostPlayer],
       state: 'lobby',
       round: 1,
       maxRounds: 5,
@@ -52,7 +155,7 @@ io.on('connection', (socket) => {
     console.log(`Комната ${roomId} создана пользователем ${hostPlayer.name}`);
   });
 
-  socket.on('join_room', ({ roomId }) => { // Убрали playerData из аргументов
+  socket.on('join_room', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return socket.emit('error', 'Комната не найдена');
     if (room.state !== 'lobby') return socket.emit('error', 'Игра уже идет');
@@ -60,7 +163,6 @@ io.on('connection', (socket) => {
     const existingPlayer = room.players.find(p => p.id === socket.user.id);
     
     if (!existingPlayer) {
-        // Новый игрок - берем данные из авторизации
         const newPlayer = {
             id: socket.user.id,
             name: socket.user.name,
@@ -70,7 +172,6 @@ io.on('connection', (socket) => {
         };
         room.players.push(newPlayer);
     } else {
-        // Переподключение
         existingPlayer.socketId = socket.id;
     }
 
@@ -82,7 +183,6 @@ io.on('connection', (socket) => {
   socket.on('update_profile', async ({ name }) => {
     if (!name || !socket.user) return;
 
-    // 1. Обновляем Supabase
     const { error } = await supabase
         .from('users')
         .update({ first_name: name })
@@ -93,19 +193,16 @@ io.on('connection', (socket) => {
         return socket.emit('error', 'Не удалось обновить имя');
     }
 
-    // 2. Обновляем локальный объект сокета
     socket.user.name = name;
 
-    // 3. Обновляем всех игроков в комнатах, где этот игрок есть
     Object.values(rooms).forEach(room => {
         const player = room.players.find(p => p.id === socket.user.id);
         if (player) {
-        player.name = name;
-        io.to(room.id).emit('update_players', room.players);
+            player.name = name;
+            io.to(room.id).emit('update_players', room.players);
         }
     });
-    });
-
+  });
 
   socket.on('get_topics', () => {
       const list = Object.keys(TOPICS).map(key => ({
@@ -117,15 +214,10 @@ io.on('connection', (socket) => {
       socket.emit('topics_list', list);
   });
 
-  // --- СТАРТ ИГРЫ ---
   socket.on('start_game', ({ roomId, settings }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) return;
-
-    // [NEW] Проверка на кол-во игроков
-    if (room.players.length < 2) {
-        return; 
-    }
+    if (room.players.length < 2) return;
 
     if (settings) {
         room.maxRounds = Number(settings.rounds) || 5;
@@ -162,17 +254,13 @@ io.on('connection', (socket) => {
     startNewRound(roomId);
   });
 
-  // --- ИГРОВОЙ ПРОЦЕСС ---
   socket.on('submit_answer', ({ roomId, text }) => {
       const room = rooms[roomId];
       if (!room || room.state !== 'writing') return;
 
       const player = room.players.find(p => p.socketId === socket.id);
       if (!player) return;
-      
-      // [NEW] Валидация на сервере тоже нужна
       if (text.length < 3) return;
-
       if (room.answers.find(a => a.authorId === player.id)) return;
 
       room.answers.push({
@@ -224,17 +312,12 @@ io.on('connection', (socket) => {
   });
   
   socket.on('request_game_state', ({ roomId }) => {
-    console.log(`📡 Запрос состояния игры для комнаты ${roomId}`); // ЛОГ
     const room = rooms[roomId];
-    if (!room) {
-        console.log(`❌ Комната ${roomId} не найдена при запросе состояния`); // ЛОГ
-        return;
-    }
+    if (!room) return;
 
     socket.emit('update_players', room.players);
 
     if (room.state === 'writing') {
-        console.log(`🔄 Отправка текущего раунда игроку (Writing)`); // ЛОГ
         socket.emit('new_round', {
             round: room.round,
             totalRounds: room.maxRounds,
@@ -244,146 +327,24 @@ io.on('connection', (socket) => {
             endTime: room.endTime,
             duration: room.timerDuration
         });
-    } 
-    else if (room.state === 'voting') {
-           const shuffled = [...room.answers]
-                .map(a => ({ id: a.id, text: a.text }))
-                .sort(() => 0.5 - Math.random());
-           socket.emit('start_voting', {
-               answers: shuffled,
-               endTime: room.endTime,
-               duration: 60
-           });
-      }
-      console.log(`📢 Отправка смены фазы: ${room.state}`); // ЛОГ
-      socket.emit('phase_change', room.state);
+    } else if (room.state === 'voting') {
+        const shuffled = [...room.answers]
+            .map(a => ({ id: a.id, text: a.text }))
+            .sort(() => 0.5 - Math.random());
+        socket.emit('start_voting', {
+            answers: shuffled,
+            endTime: room.endTime,
+            duration: 60
+        });
+    }
+    socket.emit('phase_change', room.state);
   });
 });
 
-// --- ФУНКЦИИ ---
-
-const verifyTelegramAuth = (initData) => {
-    if (!initData) return null;
-    
-    const urlParams = new URLSearchParams(initData);
-    const hash = urlParams.get('hash');
-    urlParams.delete('hash');
-
-    // Сортировка параметров
-    const checkString = Array.from(urlParams.entries())
-        .sort((a, b) => a[0].localeCompare(b[0]))
-        .map(([key, val]) => `${key}=${val}`)
-        .join('\n');
-
-    const secret = crypto.createHmac('sha256', 'WebAppData')
-        .update(process.env.TELEGRAM_BOT_TOKEN) // Убедись, что токен есть в .env
-        .digest();
-
-    const calculatedHash = crypto.createHmac('sha256', secret)
-        .update(checkString)
-        .digest('hex');
-
-    if (calculatedHash === hash) {
-        // Данные валидны
-        const userStr = urlParams.get('user');
-        return userStr ? JSON.parse(userStr) : null;
-    }
-    return null;
-};
-
-// MIDDLEWARE СОКЕТОВ (срабатывает при подключении)
-io.use(async (socket, next) => {
-  const initData = socket.handshake.auth.initData;
-  const tgUser = verifyTelegramAuth(initData);
-
-  if (tgUser) {
-    try {
-      // Пытаемся получить существующую запись пользователя из Supabase
-      const { data: dbUser, error: selectError } = await supabase
-        .from('users')
-        .select('id, first_name, username, avatar_url')
-        .eq('id', String(tgUser.id))
-        .maybeSingle();
-
-      if (selectError) console.error('Supabase select error:', selectError);
-
-      if (dbUser) {
-        // Пользователь есть в БД — предпочитаем имя из БД (если оно есть),
-        // иначе берём имя из Telegram.
-        const name = dbUser.first_name || tgUser.first_name || tgUser.username || `tg_${tgUser.id}`;
-        const avatar = dbUser.avatar_url || tgUser.photo_url || null;
-
-        // Обновляем актуальные поля (username/avatar) но не перезаписываем first_name, если он есть
-        const { error: updateError } = await supabase
-          .from('users')
-          .update({
-            username: tgUser.username || dbUser.username,
-            avatar_url: tgUser.photo_url || dbUser.avatar_url
-          })
-          .eq('id', String(tgUser.id));
-
-        if (updateError) console.error('Supabase update error:', updateError);
-
-        socket.user = {
-          id: String(tgUser.id),
-          name,
-          avatar,
-          isGuest: false
-        };
-      } else {
-        // Пользователя нет в БД — создаём запись (upsert удобен для вставки)
-        const { error: upsertError } = await supabase
-          .from('users')
-          .upsert({
-            id: String(tgUser.id),
-            first_name: tgUser.first_name || tgUser.username,
-            username: tgUser.username,
-            avatar_url: tgUser.photo_url
-          });
-
-        if (upsertError) console.error('Supabase upsert error:', upsertError);
-
-        socket.user = {
-          id: String(tgUser.id),
-          name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
-          avatar: tgUser.photo_url || null,
-          isGuest: false
-        };
-      }
-    } catch (e) {
-      console.error('Error while reading/updating supabase user:', e);
-      // fallback — всё равно пускаем как телеграм-пользователя
-      socket.user = {
-        id: String(tgUser.id),
-        name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
-        avatar: tgUser.photo_url || null,
-        isGuest: false
-      };
-    }
-  } else {
-    // Гость (тест в браузере)
-    socket.user = {
-      id: 'guest_' + Math.random().toString(36).substr(2, 9),
-      name: 'Guest',
-      isGuest: true
-    };
-  }
-
-  // Отправляем клиенту профиль (чтобы клиент мог сразу обновить UI)
-  try {
-    socket.emit('profile', socket.user);
-  } catch (e) {
-    // ничего страшного, это вспомогательное событие
-  }
-
-  next();
-});
-
+// --- GAME LOGIC FUNCTIONS ---
 function startNewRound(roomId) {
     const room = rooms[roomId];
     if (!room) return;
-
-    console.log(`🏁 Старт нового раунда: ${room.round} в комнате ${roomId}`); // ЛОГ
 
     if (room.round > room.maxRounds) {
         finishGame(roomId);
@@ -394,9 +355,7 @@ function startNewRound(roomId) {
     room.answers = [];
     room.votes = {};
     
-    // БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ВОПРОСА
     if (!room.questions || room.questions.length === 0) {
-        console.error("❌ ОШИБКА: Список вопросов пуст!");
         room.currentQuestionObj = { text: "Ошибка: вопросы не загрузились", topicEmoji: '⚠️', topicName: 'Error' };
     } else {
         room.currentQuestionObj = room.questions[room.round - 1]; 
@@ -404,7 +363,7 @@ function startNewRound(roomId) {
 
     room.endTime = Date.now() + (room.timerDuration * 1000);
 
-    const roundData = {
+    io.to(roomId).emit('new_round', {
         round: room.round,
         totalRounds: room.maxRounds,
         question: room.currentQuestionObj?.text || "...",
@@ -412,10 +371,7 @@ function startNewRound(roomId) {
         topicName: room.currentQuestionObj?.topicName || 'Тема',
         endTime: room.endTime,
         duration: room.timerDuration
-    };
-
-    console.log("📤 Отправка события new_round всем игрокам:", roundData.question); // ЛОГ
-    io.to(roomId).emit('new_round', roundData);
+    });
 
     room.timerId = setTimeout(() => {
         endWritingPhase(roomId);
@@ -463,29 +419,27 @@ function startVotingPhase(roomId) {
     }, 60000);
 }
 
-// [NEW] Обновленная логика подсчета очков
 function calculateAndShowResults(roomId) {
     const room = rooms[roomId];
     if (!room) return;
 
     room.state = 'reveal';
     const deltas = {};
-    const votesSummary = {}; // Для отображения галочек
+    const votesSummary = {};
 
     room.players.forEach(p => deltas[p.id] = 0);
 
-    // Сохраняем статистику раунда
     const roundStats = {
         question: room.currentQuestionObj.text,
         votes: []
     };
 
-    room.players.forEach(player => { // Тот КТО голосует (P1)
+    room.players.forEach(player => {
         const playerVotes = room.votes[player.id];
         if (!playerVotes) return; 
 
         Object.keys(playerVotes).forEach(ansId => {
-            const vote = playerVotes[ansId]; // { type: 'ai'|'human', playerId?: string }
+            const vote = playerVotes[ansId];
             const targetAnswer = room.answers.find(a => a.id === ansId);
             if (!targetAnswer) return;
 
@@ -493,38 +447,30 @@ function calculateAndShowResults(roomId) {
 
             let isCorrect = false;
 
-            // 1. P1 угадал, что это AI (ответ Тоста)
             if (vote.type === 'ai' && targetAnswer.authorId === 'ai') {
-                deltas[player.id] += 100; // Бонус за поимку бота
+                deltas[player.id] += 100;
                 isCorrect = true;
             }
-            // 2. P1 ошибся: подумал что это AI, а это Человек (P2)
             else if (vote.type === 'ai' && targetAnswer.authorId !== 'ai') {
-                deltas[player.id] -= 50; // Штраф за ошибку
-                // [NEW] P2 (Автор ответа) получает бонус за обман
+                deltas[player.id] -= 50;
                 if (deltas[targetAnswer.authorId] !== undefined) {
                     deltas[targetAnswer.authorId] += 108; 
                 }
             }
-            // 3. P1 угадал Человека (угадал автора P2)
             else if (vote.type === 'human' && vote.playerId === targetAnswer.authorId) {
-                deltas[player.id] += 25; // Небольшой бонус за знание друзей
-                // Автор (P2) ничего не теряет
+                deltas[player.id] += 25;
                 isCorrect = true;
             }
-            // 4. P1 ошибся с Человеком (думал это P2, а это P3 или AI)
             else {
-                deltas[player.id] -= 50; // Штраф
+                deltas[player.id] -= 50;
             }
 
-            // Запись для визуализации
             votesSummary[ansId].push({
                 playerId: player.id,
                 isCorrect: isCorrect,
-                isDeceived: (vote.type === 'ai' && targetAnswer.authorId !== 'ai') // [NEW] Флаг "Обманут"
+                isDeceived: (vote.type === 'ai' && targetAnswer.authorId !== 'ai')
             });
             
-            // Запись в историю
             roundStats.votes.push({
                 voterId: player.id,
                 targetId: targetAnswer.authorId,
@@ -535,12 +481,10 @@ function calculateAndShowResults(roomId) {
         });
     });
 
-    // Применяем очки
     room.players.forEach(p => {
         if (deltas[p.id]) p.score += deltas[p.id];
     });
 
-    // Сохраняем историю
     room.history.push(roundStats);
 
     io.to(roomId).emit('round_results', {
@@ -551,32 +495,27 @@ function calculateAndShowResults(roomId) {
     });
 }
 
-// [NEW] Функция завершения игры и подсчета ачивок
 function finishGame(roomId) {
     const room = rooms[roomId];
     room.state = 'finished';
 
-    // Считаем ачивки
     const stats = {}; 
     room.players.forEach(p => {
         stats[p.id] = { 
-            timesGuessedCorrectlyAsHuman: 0, // Его угадали (предсказуемый)
-            timesMistakenForAI: 0,          // Его приняли за бота (скрытный)
-            correctGuessesMade: 0           // Он угадал верно (детектив)
+            timesGuessedCorrectlyAsHuman: 0,
+            timesMistakenForAI: 0,
+            correctGuessesMade: 0
         };
     });
 
     room.history.forEach(round => {
         round.votes.forEach(v => {
-            // Детектив (voter)
             if (v.isCorrect && stats[v.voterId]) {
                 stats[v.voterId].correctGuessesMade++;
             }
-            // Предсказуемый (target is human, guessed as human correct)
             if (v.targetId !== 'ai' && v.isCorrect && v.guessType === 'human' && stats[v.targetId]) {
                 stats[v.targetId].timesGuessedCorrectlyAsHuman++;
             }
-            // Скрытный (target is human, guessed as AI)
             if (v.targetId !== 'ai' && v.guessType === 'ai' && stats[v.targetId]) {
                 stats[v.targetId].timesMistakenForAI++;
             }
