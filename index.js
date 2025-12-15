@@ -173,22 +173,28 @@ io.on('connection', (socket) => {
   });
   
   socket.on('request_game_state', ({ roomId }) => {
-      const room = rooms[roomId];
-      if (!room) return;
-      socket.emit('update_players', room.players);
-      
-        if (room.state === 'writing') {
-          socket.emit('new_round', {
-              round: room.round,
-              totalRounds: room.maxRounds,
-              question: room.currentQuestionObj?.text, // Отправляем текст
-              topicEmoji: room.currentQuestionObj?.topicEmoji, // Отправляем тему
-              topicName: room.currentQuestionObj?.topicName,
-              endTime: room.endTime,
-              duration: room.timerDuration
-          });
-      } 
-      else if (room.state === 'voting') {
+    console.log(`📡 Запрос состояния игры для комнаты ${roomId}`); // ЛОГ
+    const room = rooms[roomId];
+    if (!room) {
+        console.log(`❌ Комната ${roomId} не найдена при запросе состояния`); // ЛОГ
+        return;
+    }
+
+    socket.emit('update_players', room.players);
+
+    if (room.state === 'writing') {
+        console.log(`🔄 Отправка текущего раунда игроку (Writing)`); // ЛОГ
+        socket.emit('new_round', {
+            round: room.round,
+            totalRounds: room.maxRounds,
+            question: room.currentQuestionObj?.text,
+            topicEmoji: room.currentQuestionObj?.topicEmoji,
+            topicName: room.currentQuestionObj?.topicName,
+            endTime: room.endTime,
+            duration: room.timerDuration
+        });
+    } 
+    else if (room.state === 'voting') {
            const shuffled = [...room.answers]
                 .map(a => ({ id: a.id, text: a.text }))
                 .sort(() => 0.5 - Math.random());
@@ -198,6 +204,7 @@ io.on('connection', (socket) => {
                duration: 60
            });
       }
+      console.log(`📢 Отправка смены фазы: ${room.state}`); // ЛОГ
       socket.emit('phase_change', room.state);
   });
 });
@@ -208,7 +215,8 @@ function startNewRound(roomId) {
     const room = rooms[roomId];
     if (!room) return;
 
-    // [NEW] Проверка конца игры
+    console.log(`🏁 Старт нового раунда: ${room.round} в комнате ${roomId}`); // ЛОГ
+
     if (room.round > room.maxRounds) {
         finishGame(roomId);
         return;
@@ -217,11 +225,18 @@ function startNewRound(roomId) {
     room.state = 'writing';
     room.answers = [];
     room.votes = {};
-    room.currentQuestionObj = room.questions[room.round - 1]; 
     
+    // БЕЗОПАСНОЕ ПОЛУЧЕНИЕ ВОПРОСА
+    if (!room.questions || room.questions.length === 0) {
+        console.error("❌ ОШИБКА: Список вопросов пуст!");
+        room.currentQuestionObj = { text: "Ошибка: вопросы не загрузились", topicEmoji: '⚠️', topicName: 'Error' };
+    } else {
+        room.currentQuestionObj = room.questions[room.round - 1]; 
+    }
+
     room.endTime = Date.now() + (room.timerDuration * 1000);
 
-    io.to(roomId).emit('new_round', {
+    const roundData = {
         round: room.round,
         totalRounds: room.maxRounds,
         question: room.currentQuestionObj?.text || "...",
@@ -229,7 +244,10 @@ function startNewRound(roomId) {
         topicName: room.currentQuestionObj?.topicName || 'Тема',
         endTime: room.endTime,
         duration: room.timerDuration
-    });
+    };
+
+    console.log("📤 Отправка события new_round всем игрокам:", roundData.question); // ЛОГ
+    io.to(roomId).emit('new_round', roundData);
 
     room.timerId = setTimeout(() => {
         endWritingPhase(roomId);
