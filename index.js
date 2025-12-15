@@ -217,7 +217,7 @@ io.on('connection', (socket) => {
   socket.on('start_game', ({ roomId, settings }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) return;
-    if (room.players.length < 2) return;
+    //if (room.players.length < 2) return;
 
     if (settings) {
         room.maxRounds = Number(settings.rounds) || 5;
