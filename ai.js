@@ -4,7 +4,7 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- НАСТРОЙКА GOOGLE ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const googleModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const googleModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: СТРОГАЯ ОЧИСТКА КАВЫЧЕК ---
 function cleanResponse(text) {
@@ -26,8 +26,6 @@ function cleanResponse(text) {
 
 // --- ГЕНЕРАЦИЯ ПРОМПТА ---
 function createPrompt(question, playerAnswers) {
-    // 1. Убрали заглушки. Теперь используем только реальные ответы.
-    // Если массив пустой (чего быть не должно по твоим словам), будет пустая строка.
     const contextAnswers = playerAnswers.map(a => `- ${a}`).join('\n');
 
     return `
@@ -43,10 +41,10 @@ function createPrompt(question, playerAnswers) {
         Вопрос: "${question}"
 
         Ответы других игроков:
-        ${contextAnswers.map(a => `- ${a}`).join('\n')}
+        ${contextAnswers}
 
         Верни ТОЛЬКО свой ответ, без кавычек, пояснений и всего остального.
-        `;
+    `;
 }
 
 // --- ЗАПРОС К MISTRAL ---
@@ -98,10 +96,10 @@ async function generateAiAnswer(question, playerAnswers) {
         // Фолбэки на самый крайний случай (если API упали)
         const fallbacks = [
             "...",
-            "хз",
-            "не знаю",
-            "сложно",
-            "эммм"
+            "Хз",
+            "Не знаю",
+            "Сложно",
+            "Эммм"
         ];
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
