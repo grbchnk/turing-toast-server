@@ -63,6 +63,8 @@ async function callMistral(prompt) {
 async function generateAiAnswer(question, playerAnswers) {
   const prompt = createPrompt(question, playerAnswers);
 
+    console.log("🔍 Входящие ответы игроков:", prompt);
+
   // Вспомогательная функция для умной очистки кавычек
   const cleanResponse = (text) => {
       if (!text) return "";
