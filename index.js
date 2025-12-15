@@ -126,44 +126,60 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
-  socket.on('check_reconnect', () => {
-      // Ищем комнату, где есть игрок
+    socket.on('check_reconnect', () => {
+      // Ищем комнату
       const room = Object.values(rooms).find(r => 
           r.players.some(p => p.id === socket.user.id)
       );
 
-      // [FIX] Добавляем проверку статуса:
-      // Если комната есть, но статус 'finished' или 'game_over', мы НЕ реконнектим.
-      // Игрок просто останется в меню.
       if (room && room.state !== 'finished' && room.state !== 'game_over') {
-          
           const player = room.players.find(p => p.id === socket.user.id);
+          
           if (player) {
-              player.socketId = socket.id;
-              
-              if (room.hostId === player.socketId) { 
-                  room.hostId = socket.id;
+              // [FIX] Сначала проверяем, был ли этот игрок ХОСТОМ (по старому socketId)
+              if (room.hostId === player.socketId) {
+                  room.hostId = socket.id; // Передаем права хоста новому сокету
               }
+
+              // [FIX] И только ПОТОМ обновляем socketId игрока
+              player.socketId = socket.id;
           }
 
           socket.join(room.id);
           
           socket.emit('reconnect_success', {
               roomId: room.id,
-              isHost: room.hostId === socket.id,
+              isHost: room.hostId === socket.id, // Теперь это вернет true
               gameState: room.state,
-              players: room.players
+              players: room.players 
           });
           
-          console.log(`Игрок ${socket.user.name} вернулся в игру ${room.id}`);
+          console.log(`Игрок ${socket.user.name} вернулся в игру ${room.id} (Host: ${room.hostId === socket.id})`);
+      }
+  });
+
+  socket.on('leave_room', ({ roomId }) => {
+      const room = rooms[roomId];
+      if (!room) return;
+
+      console.log(`Игрок ${socket.user.name} покинул комнату ${roomId}`);
+
+      // Убираем игрока из списка
+      room.players = room.players.filter(p => p.id !== socket.user.id);
+      socket.leave(roomId);
+
+      // Если в комнате никого не осталось — удаляем её
+      if (room.players.length === 0) {
+          delete rooms[roomId];
+          console.log(`Комната ${roomId} удалена (пустая)`);
       } else {
-          // Если комната найдена, но игра окончена — можно удалить игрока из этой комнаты, 
-          // чтобы в следующий раз поиск даже не находил эту комнату.
-          if (room && (room.state === 'finished' || room.state === 'game_over')) {
-               // Опционально: можно принудительно "забыть" игрока в этой комнате
-               // но лучше просто дать сработать очистке по таймеру (см. ниже)
-               console.log(`Игрок ${socket.user.name} пытался вернуться в завершенную игру.`);
+          // Если ушел ХОСТ, назначаем нового (первого попавшегося)
+          if (room.hostId === socket.id) {
+              room.hostId = room.players[0].socketId;
+              // Можно оповестить нового хоста, но достаточно просто обновить список
           }
+          // Оповещаем оставшихся
+          io.to(roomId).emit('update_players', room.players);
       }
   });
 
