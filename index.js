@@ -127,35 +127,53 @@ io.on('connection', (socket) => {
   console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
     socket.on('check_reconnect', () => {
-      // Ищем комнату
+      // Ищем комнату, где есть этот юзер
       const room = Object.values(rooms).find(r => 
           r.players.some(p => p.id === socket.user.id)
       );
 
-      if (room && room.state !== 'finished' && room.state !== 'game_over') {
-          const player = room.players.find(p => p.id === socket.user.id);
+      if (room) {
+          // ЛОГИКА "УМНОГО" РЕКОННЕКТА
           
-          if (player) {
-              // [FIX] Сначала проверяем, был ли этот игрок ХОСТОМ (по старому socketId)
-              if (room.hostId === player.socketId) {
-                  room.hostId = socket.id; // Передаем права хоста новому сокету
-                }
+          // 1. Если игра закончена — выкидываем
+          if (room.state === 'finished' || room.state === 'game_over') {
+             return; 
+          }
 
-              // [FIX] И только ПОТОМ обновляем socketId игрока
-              player.socketId = socket.id;
+          // 2. Если это ЛОББИ и игрок там ОДИН (и он вышел из приложения) ->
+          // Считаем, что комната умерла. Удаляем её и не реконнектим.
+          if (room.state === 'lobby' && room.players.length === 1) {
+              delete rooms[room.id];
+              console.log(`Комната ${room.id} удалена (хост покинул лобби через закрытие)`);
+              return; // Клиент останется в меню
+          }
+
+          // 3. Восстанавливаем игрока
+          const player = room.players.find(p => p.id === socket.user.id);
+          if (player) {
+              player.socketId = socket.id; // Обновляем сокет
               player.isOnline = true;
+          }
+          
+          // 4. ВОССТАНОВЛЕНИЕ ПРАВ ХОСТА (По ID юзера, а не сокета!)
+          // Если ID юзера совпадает с hostUserId комнаты
+          if (room.hostUserId === socket.user.id) {
+              room.hostId = socket.id; // Обновляем активный сокет хоста
           }
 
           socket.join(room.id);
           
           socket.emit('reconnect_success', {
               roomId: room.id,
-              isHost: room.hostId === socket.id, // Теперь это вернет true
+              isHost: room.hostUserId === socket.user.id, // Надежная проверка
               gameState: room.state,
               players: room.players 
           });
           
-          console.log(`Игрок ${socket.user.name} вернулся в игру ${room.id} (Host: ${room.hostId === socket.id})`);
+          console.log(`Игрок ${socket.user.name} реконнект в ${room.id}`);
+      } else {
+          // Если комнаты нет, явно говорим клиенту "сессии нет"
+          socket.emit('session_not_found');
       }
   });
 
@@ -165,21 +183,20 @@ io.on('connection', (socket) => {
 
       console.log(`Игрок ${socket.user.name} покинул комнату ${roomId}`);
 
-      // Убираем игрока из списка
       room.players = room.players.filter(p => p.id !== socket.user.id);
       socket.leave(roomId);
 
-      // Если в комнате никого не осталось — удаляем её
       if (room.players.length === 0) {
           delete rooms[roomId];
           console.log(`Комната ${roomId} удалена (пустая)`);
       } else {
-          // Если ушел ХОСТ, назначаем нового (первого попавшегося)
-          if (room.hostId === socket.id) {
-              room.hostId = room.players[0].socketId;
-              // Можно оповестить нового хоста, но достаточно просто обновить список
+          // Если ушел ХОСТ -> передаем права следующему
+          if (room.hostUserId === socket.user.id) {
+              const newHost = room.players[0];
+              room.hostUserId = newHost.id; // [FIX] Передаем User ID
+              room.hostId = newHost.socketId; // Передаем Socket ID
+              // Можно отправить событие new_host, если нужно обновить UI у других
           }
-          // Оповещаем оставшихся
           io.to(roomId).emit('update_players', room.players);
       }
   });
@@ -198,7 +215,8 @@ io.on('connection', (socket) => {
 
     rooms[roomId] = {
       id: roomId,
-      hostId: socket.id,
+      hostId: socket.id,       // Текущий сокет (для emits)
+      hostUserId: socket.user.id, // [FIX] ID пользователя (для прав)
       players: [hostPlayer],
       state: 'lobby',
       round: 1,
@@ -211,7 +229,7 @@ io.on('connection', (socket) => {
     };
     socket.join(roomId);
     socket.emit('room_created', rooms[roomId]);
-    console.log(`Комната ${roomId} создана пользователем ${hostPlayer.name}`);
+    console.log(`Комната ${roomId} создана ${hostPlayer.name}`);
   });
 
   socket.on('join_room', ({ roomId }) => {
