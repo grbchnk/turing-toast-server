@@ -5,6 +5,8 @@ const cors = require('cors');
 const TOPICS = require('./topics');
 require('dotenv').config();
 const { generateAiAnswer } = require('./ai');
+const crypto = require('crypto'); // Встроенная в Node.js библиотека
+const supabase = require('./supabase'); // Наш файл из шага 3
 
 const app = express();
 app.use(cors());
@@ -17,15 +19,25 @@ const io = new Server(server, {
 const rooms = {}; 
 
 io.on('connection', (socket) => {
-  console.log(`🔌 Подключение: ${socket.id}`);
+  console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
   // --- ЛОББИ ---
-  socket.on('create_room', (playerData) => {
+  socket.on('create_room', () => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
+    
+    // Формируем объект игрока из проверенных данных сокета
+    const hostPlayer = {
+        id: socket.user.id,
+        name: socket.user.name,
+        avatar: socket.user.avatar, // Если сохранял URL фото
+        socketId: socket.id,
+        score: 0
+    };
+
     rooms[roomId] = {
       id: roomId,
       hostId: socket.id,
-      players: [{ ...playerData, socketId: socket.id, score: 0 }],
+      players: [hostPlayer], // <--- Используем hostPlayer
       state: 'lobby',
       round: 1,
       maxRounds: 5,
@@ -33,21 +45,32 @@ io.on('connection', (socket) => {
       timerId: null,
       answers: [],
       votes: {},
-      history: [] // [NEW] История для ачивок
+      history: []
     };
     socket.join(roomId);
     socket.emit('room_created', rooms[roomId]);
+    console.log(`Комната ${roomId} создана пользователем ${hostPlayer.name}`);
   });
 
-  socket.on('join_room', ({ roomId, playerData }) => {
+  socket.on('join_room', ({ roomId }) => { // Убрали playerData из аргументов
     const room = rooms[roomId];
     if (!room) return socket.emit('error', 'Комната не найдена');
     if (room.state !== 'lobby') return socket.emit('error', 'Игра уже идет');
 
-    const existingPlayer = room.players.find(p => p.id === playerData.id);
+    const existingPlayer = room.players.find(p => p.id === socket.user.id);
+    
     if (!existingPlayer) {
-        room.players.push({ ...playerData, socketId: socket.id, score: 0 });
+        // Новый игрок - берем данные из авторизации
+        const newPlayer = {
+            id: socket.user.id,
+            name: socket.user.name,
+            avatar: socket.user.avatar,
+            socketId: socket.id,
+            score: 0
+        };
+        room.players.push(newPlayer);
     } else {
+        // Переподключение
         existingPlayer.socketId = socket.id;
     }
 
@@ -210,6 +233,74 @@ io.on('connection', (socket) => {
 });
 
 // --- ФУНКЦИИ ---
+
+const verifyTelegramAuth = (initData) => {
+    if (!initData) return null;
+    
+    const urlParams = new URLSearchParams(initData);
+    const hash = urlParams.get('hash');
+    urlParams.delete('hash');
+
+    // Сортировка параметров
+    const checkString = Array.from(urlParams.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([key, val]) => `${key}=${val}`)
+        .join('\n');
+
+    const secret = crypto.createHmac('sha256', 'WebAppData')
+        .update(process.env.TELEGRAM_BOT_TOKEN) // Убедись, что токен есть в .env
+        .digest();
+
+    const calculatedHash = crypto.createHmac('sha256', secret)
+        .update(checkString)
+        .digest('hex');
+
+    if (calculatedHash === hash) {
+        // Данные валидны
+        const userStr = urlParams.get('user');
+        return userStr ? JSON.parse(userStr) : null;
+    }
+    return null;
+};
+
+// MIDDLEWARE СОКЕТОВ (срабатывает при подключении)
+io.use(async (socket, next) => {
+    const initData = socket.handshake.auth.initData;
+    
+    // 1. Пытаемся проверить данные ТГ
+    const tgUser = verifyTelegramAuth(initData);
+
+    if (tgUser) {
+        // 2. Если проверка прошла — сохраняем/обновляем в Supabase
+        const { error } = await supabase
+            .from('users')
+            .upsert({
+                id: tgUser.id,
+                first_name: tgUser.first_name,
+                username: tgUser.username,
+                avatar_url: tgUser.photo_url
+            });
+
+        if (error) console.error('Supabase Error:', error);
+
+        // 3. Прикрепляем данные к сокету
+        socket.user = {
+            id: tgUser.id,
+            name: tgUser.first_name,
+            avatar: tgUser.photo_url,
+            isGuest: false
+        };
+    } else {
+        // 4. Если данных нет (тестируем в браузере) — пускаем как гостя
+        socket.user = {
+            id: 'guest_' + Math.random().toString(36).substr(2, 9),
+            name: 'Guest',
+            isGuest: true
+        };
+    }
+    
+    next();
+});
 
 function startNewRound(roomId) {
     const room = rooms[roomId];
