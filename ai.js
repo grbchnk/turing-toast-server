@@ -46,7 +46,7 @@ function createPrompt(question, playerAnswers) {
         ${contextAnswers.map(a => `- ${a}`).join('\n')}
 
         Верни ТОЛЬКО свой ответ, без кавычек, пояснений и всего остального.
-        `
+        `;
 }
 
 // --- ЗАПРОС К MISTRAL ---
