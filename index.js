@@ -151,7 +151,8 @@ io.on('connection', (socket) => {
           socket.emit('reconnect_success', {
               roomId: room.id,
               isHost: room.hostId === socket.id,
-              gameState: room.state
+              gameState: room.state,
+              players: room.players
           });
           
           console.log(`Игрок ${socket.user.name} вернулся в игру ${room.id}`);
