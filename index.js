@@ -126,6 +126,37 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
+  socket.on('check_reconnect', () => {
+      // Ищем комнату, где есть игрок с таким же User ID (не socket ID)
+      const room = Object.values(rooms).find(r => 
+          r.players.some(p => p.id === socket.user.id)
+      );
+
+      if (room) {
+          // Обновляем socketId игрока в объекте комнаты
+          const player = room.players.find(p => p.id === socket.user.id);
+          if (player) {
+              player.socketId = socket.id;
+              
+              // Если это был хост, обновляем хоста (на всякий случай)
+              if (room.hostId === player.socketId) { // старый сокет
+                  room.hostId = socket.id;
+              }
+          }
+
+          socket.join(room.id);
+          
+          // Отправляем данные для реконнекта
+          socket.emit('reconnect_success', {
+              roomId: room.id,
+              isHost: room.hostId === socket.id,
+              gameState: room.state
+          });
+          
+          console.log(`Игрок ${socket.user.name} переподключился к комнате ${room.id}`);
+      }
+  });
+
   socket.on('create_room', () => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
     
@@ -214,10 +245,19 @@ io.on('connection', (socket) => {
       socket.emit('topics_list', list);
   });
 
+socket.on('send_reaction', ({ roomId, emoji }) => {
+      // [UPDATED] Добавляем senderId: socket.user.id
+      io.to(roomId).emit('animate_reaction', { 
+          emoji, 
+          id: Math.random(), 
+          senderId: socket.user.id // <-- Важно!
+      });
+  });
+
   socket.on('start_game', ({ roomId, settings }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) return;
-    if (room.players.length < 1) return;
+    if (room.players.length < 2) return;
 
     if (settings) {
         room.maxRounds = Number(settings.rounds) || 5;
