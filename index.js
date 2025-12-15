@@ -204,7 +204,6 @@ io.on('connection', (socket) => {
           io.to(roomId).emit('update_players', room.players);
       }
   });
-  });
 
   socket.on('create_room', () => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
@@ -297,7 +296,8 @@ io.on('connection', (socket) => {
       socket.emit('topics_list', list);
   });
 
-socket.on('send_reaction', ({ roomId, emoji }) => {
+  
+    socket.on('send_reaction', ({ roomId, emoji }) => {
       // [UPDATED] Добавляем senderId: socket.user.id
       io.to(roomId).emit('animate_reaction', { 
           emoji, 
@@ -451,6 +451,7 @@ socket.on('request_game_state', ({ roomId }) => {
         }
     }
     // Для 'ai_processing' ничего слать не нужно, клиент просто показывает лоадер по phase_change
+  });
   });
 
 // --- GAME LOGIC FUNCTIONS ---
