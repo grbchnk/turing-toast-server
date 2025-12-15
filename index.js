@@ -127,33 +127,42 @@ io.on('connection', (socket) => {
   console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
 
   socket.on('check_reconnect', () => {
-      // Ищем комнату, где есть игрок с таким же User ID (не socket ID)
+      // Ищем комнату, где есть игрок
       const room = Object.values(rooms).find(r => 
           r.players.some(p => p.id === socket.user.id)
       );
 
-      if (room) {
-          // Обновляем socketId игрока в объекте комнаты
+      // [FIX] Добавляем проверку статуса:
+      // Если комната есть, но статус 'finished' или 'game_over', мы НЕ реконнектим.
+      // Игрок просто останется в меню.
+      if (room && room.state !== 'finished' && room.state !== 'game_over') {
+          
           const player = room.players.find(p => p.id === socket.user.id);
           if (player) {
               player.socketId = socket.id;
               
-              // Если это был хост, обновляем хоста (на всякий случай)
-              if (room.hostId === player.socketId) { // старый сокет
+              if (room.hostId === player.socketId) { 
                   room.hostId = socket.id;
               }
           }
 
           socket.join(room.id);
           
-          // Отправляем данные для реконнекта
           socket.emit('reconnect_success', {
               roomId: room.id,
               isHost: room.hostId === socket.id,
               gameState: room.state
           });
           
-          console.log(`Игрок ${socket.user.name} переподключился к комнате ${room.id}`);
+          console.log(`Игрок ${socket.user.name} вернулся в игру ${room.id}`);
+      } else {
+          // Если комната найдена, но игра окончена — можно удалить игрока из этой комнаты, 
+          // чтобы в следующий раз поиск даже не находил эту комнату.
+          if (room && (room.state === 'finished' || room.state === 'game_over')) {
+               // Опционально: можно принудительно "забыть" игрока в этой комнате
+               // но лучше просто дать сработать очистке по таймеру (см. ниже)
+               console.log(`Игрок ${socket.user.name} пытался вернуться в завершенную игру.`);
+          }
       }
   });
 
@@ -537,7 +546,10 @@ function calculateAndShowResults(roomId) {
 
 function finishGame(roomId) {
     const room = rooms[roomId];
-    room.state = 'finished';
+    if (!room) return; // Защита от краша
+
+    // [FIX] Ставим статус game_over, чтобы check_reconnect его отсекал
+    room.state = 'game_over'; 
 
     const stats = {}; 
     room.players.forEach(p => {
@@ -596,6 +608,16 @@ function finishGame(roomId) {
         players: room.players.sort((a,b) => b.score - a.score),
         achievements: achievements
     });
+
+    console.log(`Комната ${roomId} завершена. Будет удалена через 10 минут.`);
+    
+    setTimeout(() => {
+        if (rooms[roomId]) {
+            delete rooms[roomId];
+            console.log(`🗑️ Комната ${roomId} удалена из памяти (очистка).`);
+        }
+    }, 180000); // через 3 минуты
+    
 }
 
 const PORT = process.env.PORT || 3001;
