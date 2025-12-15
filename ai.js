@@ -45,7 +45,7 @@ async function callMistral(prompt) {
             "Authorization": `Bearer ${process.env.MISTRAL_API_KEY}`
         },
         body: JSON.stringify({
-            model: "open-mistral-7b", // Актуальное название (бывший mistral-tiny)
+            model: "open-mixtral-8x7b",
             messages: [{ role: "user", content: prompt }],
             temperature: 0.9,
             max_tokens: 100
