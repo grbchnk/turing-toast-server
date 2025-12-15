@@ -176,8 +176,29 @@ io.on('connection', (socket) => {
       const room = rooms[roomId];
       if (!room) return;
       socket.emit('update_players', room.players);
-      // Логика восстановления состояния... (оставим как было в оригинале для краткости, там всё ок)
-      // В реальном проекте скопируй этот блок из старого файла
+      
+        if (room.state === 'writing') {
+          socket.emit('new_round', {
+              round: room.round,
+              totalRounds: room.maxRounds,
+              question: room.currentQuestionObj?.text, // Отправляем текст
+              topicEmoji: room.currentQuestionObj?.topicEmoji, // Отправляем тему
+              topicName: room.currentQuestionObj?.topicName,
+              endTime: room.endTime,
+              duration: room.timerDuration
+          });
+      } 
+      else if (room.state === 'voting') {
+           const shuffled = [...room.answers]
+                .map(a => ({ id: a.id, text: a.text }))
+                .sort(() => 0.5 - Math.random());
+           socket.emit('start_voting', {
+               answers: shuffled,
+               endTime: room.endTime,
+               duration: 60
+           });
+      }
+      socket.emit('phase_change', room.state);
   });
 });
 
