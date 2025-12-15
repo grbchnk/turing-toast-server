@@ -139,10 +139,11 @@ io.on('connection', (socket) => {
               // [FIX] Сначала проверяем, был ли этот игрок ХОСТОМ (по старому socketId)
               if (room.hostId === player.socketId) {
                   room.hostId = socket.id; // Передаем права хоста новому сокету
-              }
+                }
 
               // [FIX] И только ПОТОМ обновляем socketId игрока
               player.socketId = socket.id;
+              player.isOnline = true;
           }
 
           socket.join(room.id);
@@ -191,7 +192,8 @@ io.on('connection', (socket) => {
         name: socket.user.name,
         avatar: socket.user.avatar,
         socketId: socket.id,
-        score: 0
+        score: 0,
+        isOnline: true
     };
 
     rooms[roomId] = {
@@ -225,7 +227,8 @@ io.on('connection', (socket) => {
             name: socket.user.name,
             avatar: socket.user.avatar,
             socketId: socket.id,
-            score: 0
+            score: 0,
+            isOnline: true
         };
         room.players.push(newPlayer);
     } else {

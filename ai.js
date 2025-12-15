@@ -4,37 +4,52 @@ const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 // --- НАСТРОЙКА GOOGLE ---
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-// Используем стабильную версию 1.5, у нее большие лимиты
-const googleModel = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const googleModel = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
-// --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ГЕНЕРАЦИЯ ПРОМПТА ---
-function createPrompt(question, playerAnswers) {
-    const contextAnswers = playerAnswers.length > 0 
-        ? playerAnswers 
-        : ["хз ваще))", "Ну типа того..", "Я не знаю ахахах"];
-
-    return `
-      Ты играешь в социальную игру "Тест Тьюринга". Твоя цель — притвориться человеком и не быть пойманным.
-      
-      ИНСТРУКЦИЯ:
-      1. Проанализируй стиль ответов игроков (длина, наличие эмодзи, сленг, ошибки).
-      2. Придумай СВОЙ ответ на вопрос.
-      3. Твой ответ должен сливаться с толпой. Если они пишут коротко и с маленькой буквы — делай так же. Если пишут с большой - делай так же. Если они шутят абсурдно — шути так же.
-      4. НЕ пиши литературно, если другие так не делают. НЕ будь полезным ассистентом. Будь "своим челиком".
-      5. Если они используют юмор или нецензурную брань - используй эту хуйню тоже.
-      6. Ответ должен быть на русском языке.
-      7. Длина сообщения должна быть такой же, как и длина сообщений игроков (не нужно выделяться).
-
-      ВОПРОС: "${question}"
-      
-      Вот ответы других реальных игроков:
-      ${contextAnswers.map(a => `- ${a}`).join('\n')}
-      
-      Верни ТОЛЬКО текст ответа, без кавычек и пояснений.
-    `;
+// --- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: СТРОГАЯ ОЧИСТКА КАВЫЧЕК ---
+function cleanResponse(text) {
+    if (!text) return "";
+    let clean = text.trim();
+    
+    // Проверяем двойные кавычки: удаляем ТОЛЬКО если они с двух сторон
+    if (clean.length > 1 && clean.startsWith('"') && clean.endsWith('"')) {
+        return clean.slice(1, -1);
+    }
+    
+    // Проверяем одинарные кавычки: удаляем ТОЛЬКО если они с двух сторон
+    if (clean.length > 1 && clean.startsWith("'") && clean.endsWith("'")) {
+        return clean.slice(1, -1);
+    }
+    
+    return clean;
 }
 
-// --- ФУНКЦИЯ ЗАПРОСА К MISTRAL ---
+// --- ГЕНЕРАЦИЯ ПРОМПТА ---
+function createPrompt(question, playerAnswers) {
+    // 1. Убрали заглушки. Теперь используем только реальные ответы.
+    // Если массив пустой (чего быть не должно по твоим словам), будет пустая строка.
+    const contextList = playerAnswers.map(a => `- ${a}`).join('\n');
+
+    return `
+        Ты играешь в игру "Тест Тьюринга". Твоя задача — притворяться обычным человеком, чтобы тебя не раскрыли как ИИ.
+
+        Правила:
+        1. Посмотри на ответы других игроков: как они пишут (длинно/коротко, с большой буквы или нет, эмодзи, сленг, ошибки, мат, юмор).
+        2. Придумай свой ответ на вопрос, который полностью вливается в их стиль.
+        3. Пиши так же, как большинство: такая же длина, такие же буквы, эмодзи, мат и юмор, если они есть.
+        4. Не выделяйся: не пиши слишком грамотно, длинно или "как бот". Будь обычным человеком из чата.
+        5. Отвечай только на русском.
+
+        Вопрос: "${question}"
+
+        Ответы других игроков:
+        ${contextAnswers.map(a => `- ${a}`).join('\n')}
+
+        Верни ТОЛЬКО свой ответ, без кавычек, пояснений и всего остального.
+        `
+}
+
+// --- ЗАПРОС К MISTRAL ---
 async function callMistral(prompt) {
     if (!process.env.MISTRAL_API_KEY) throw new Error("No Mistral Key");
 
@@ -47,8 +62,8 @@ async function callMistral(prompt) {
         body: JSON.stringify({
             model: "open-mixtral-8x7b",
             messages: [{ role: "user", content: prompt }],
-            temperature: 0.9,
-            max_tokens: 100
+            temperature: 1.0, // Высокая температура для живости
+            max_tokens: 150
         })
     });
 
@@ -62,33 +77,31 @@ async function callMistral(prompt) {
 
 // --- ГЛАВНАЯ ФУНКЦИЯ ---
 async function generateAiAnswer(question, playerAnswers) {
+  // Теперь мы просто передаем то, что пришло. Без "хз ваще))"
   const prompt = createPrompt(question, playerAnswers);
 
-  // 1. ПОПЫТКА ЧЕРЕЗ GOOGLE (ОСНОВНОЙ)
   try {
     const result = await googleModel.generateContent(prompt);
     const response = await result.response;
-    let text = response.text();
-    return text.trim().replace(/^["']|["']$/g, '');
+    const text = response.text();
+    return cleanResponse(text);
   } catch (googleError) {
     console.warn("⚠️ Google API failed, switching to Mistral...", googleError.message);
 
-    // 2. ПОПЫТКА ЧЕРЕЗ MISTRAL (ЗАПАСНОЙ)
     try {
         const mistralText = await callMistral(prompt);
         console.log("✅ Saved by Mistral AI");
-        return mistralText.trim().replace(/^["']|["']$/g, '');
+        return cleanResponse(mistralText);
     } catch (mistralError) {
         console.error("❌ Both AIs failed:", mistralError.message);
         
-        // 3. ЗАПАСНЫЕ ФРАЗЫ (ЕСЛИ ВСЕ УПАЛО)
+        // Фолбэки на самый крайний случай (если API упали)
         const fallbacks = [
-            "У меня инет лагает, ща...",
-            "Блин, сложно придумать",
-            "Да я хз даже что ответить",
-            "Ну это смотря с какой стороны посмотреть",
-            "Ой, всё",
-            "ошибка какая-то 404"
+            "...",
+            "хз",
+            "не знаю",
+            "сложно",
+            "эммм"
         ];
         return fallbacks[Math.floor(Math.random() * fallbacks.length)];
     }
