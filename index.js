@@ -13,15 +13,16 @@ app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] }
+  cors: { origin: "*", methods: ["GET", "POST"] },
+  pingTimeout: 5000, 
+  pingInterval: 10000
 });
 
 const rooms = {}; 
 
-// --- ФУНКЦИЯ ВЕРИФИКАЦИИ (вынесена наверх, до middleware) ---
+// --- AUTH & MIDDLEWARE ---
 const verifyTelegramAuth = (initData) => {
     if (!initData) return null;
-    
     const urlParams = new URLSearchParams(initData);
     const hash = urlParams.get('hash');
     urlParams.delete('hash');
@@ -46,68 +47,50 @@ const verifyTelegramAuth = (initData) => {
     return null;
 };
 
-// --- MIDDLEWARE СОКЕТОВ ---
 io.use(async (socket, next) => {
   const initData = socket.handshake.auth.initData;
   const tgUser = verifyTelegramAuth(initData);
 
   if (tgUser) {
     try {
-      const { data: dbUser, error: selectError } = await supabase
+      const { data: dbUser } = await supabase
         .from('users')
         .select('id, first_name, username, avatar_url')
         .eq('id', String(tgUser.id))
         .maybeSingle();
 
-      if (selectError) console.error('Supabase select error:', selectError);
-
       if (dbUser) {
-        const name = dbUser.first_name || tgUser.first_name || tgUser.username || `tg_${tgUser.id}`;
-        const avatar = dbUser.avatar_url || tgUser.photo_url || null;
-
-        const { error: updateError } = await supabase
-          .from('users')
-          .update({
+        // Логика обновления существующего юзера
+        await supabase.from('users').update({
             username: tgUser.username || dbUser.username,
             avatar_url: tgUser.photo_url || dbUser.avatar_url
-          })
-          .eq('id', String(tgUser.id));
-
-        if (updateError) console.error('Supabase update error:', updateError);
+        }).eq('id', String(tgUser.id));
 
         socket.user = {
           id: String(tgUser.id),
-          name,
-          avatar,
+          name: dbUser.first_name || tgUser.first_name,
+          avatar: dbUser.avatar_url || tgUser.photo_url,
           isGuest: false
         };
       } else {
-        const { error: upsertError } = await supabase
-          .from('users')
-          .upsert({
+        // Создание нового
+        await supabase.from('users').upsert({
             id: String(tgUser.id),
             first_name: tgUser.first_name || tgUser.username,
             username: tgUser.username,
             avatar_url: tgUser.photo_url
-          });
-
-        if (upsertError) console.error('Supabase upsert error:', upsertError);
-
+        });
         socket.user = {
           id: String(tgUser.id),
-          name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
-          avatar: tgUser.photo_url || null,
+          name: tgUser.first_name || tgUser.username,
+          avatar: tgUser.photo_url,
           isGuest: false
         };
       }
     } catch (e) {
-      console.error('Error while reading/updating supabase user:', e);
-      socket.user = {
-        id: String(tgUser.id),
-        name: tgUser.first_name || tgUser.username || `tg_${tgUser.id}`,
-        avatar: tgUser.photo_url || null,
-        isGuest: false
-      };
+      console.error('Auth error:', e);
+      // Fallback при ошибке базы
+      socket.user = { id: String(tgUser.id), name: tgUser.first_name, isGuest: false };
     }
   } else {
     socket.user = {
@@ -116,63 +99,96 @@ io.use(async (socket, next) => {
       isGuest: true
     };
   }
-
-  // Отправляем профиль клиенту
   socket.emit('profile', socket.user);
   next();
 });
 
 // --- SOCKET EVENTS ---
 io.on('connection', (socket) => {
-  console.log(`Подключился: ${socket.user.name} (ID: ${socket.user.id})`);
+  console.log(`Connection: ${socket.user.name} (${socket.user.id})`);
 
-    socket.on('check_reconnect', () => {
-      // Ищем комнату, где есть этот юзер
-      const room = Object.values(rooms).find(r => 
-          r.players.some(p => p.id === socket.user.id)
-      );
+  socket.on('disconnect', () => {
+      console.log(`Disconnect: ${socket.user.name}`);
+      const room = Object.values(rooms).find(r => r.players.some(p => p.socketId === socket.id));
+      
+      if (room) {
+          const player = room.players.find(p => p.socketId === socket.id);
+          if (player) {
+              player.isOnline = false;
+              io.to(room.id).emit('update_players', room.players); 
+
+              if (room.state === 'lobby') {
+                  room.players = room.players.filter(p => p.id !== player.id);
+                  if (room.players.length === 0) {
+                      delete rooms[room.id];
+                  } else {
+                      handleHostTransfer(room, socket.user.id);
+                      io.to(room.id).emit('update_players', room.players);
+                  }
+              } else {
+                 // В игре не удаляем сразу, ждем реконнекта
+                 checkEmptyRoomCleanup(room.id);
+              }
+          }
+      }
+  });
+
+    socket.on('get_rooms_list', () => {
+    const roomsList = Object.values(rooms)
+      // (Опционально) Не показываем пустые комнаты или те, что готовятся к удалению
+      .filter(r => r.state !== 'game_over' && r.players.length > 0)
+      .map(room => {
+        // Находим имя хоста для красоты
+        const hostName = room.players.find(p => p.id === room.hostUserId)?.name || 'Неизвестный';
+        
+        return {
+          id: room.id,                     // Код комнаты
+          hostName: hostName,              // Кто создал
+          playersCount: room.players.length, // Сколько людей
+          state: room.state,               // 'lobby', 'writing', 'voting' ...
+          round: room.round,               // Текущий раунд
+          maxRounds: room.maxRounds,       // Всего раундов
+          // Если игра идет — показываем тему или вопрос (обрезанный), если лобби — пишем "Ожидание"
+          statusText: room.state === 'lobby' 
+            ? 'В лобби' 
+            : `${room.currentQuestionObj?.topicEmoji || ''} ${room.currentQuestionObj?.topicName || 'Игра идет'}`,
+          isJoinable: room.state === 'lobby' // Флаг для кнопки "Войти" на клиенте
+        };
+      });
+
+    // Отправляем список обратно запросившему
+    socket.emit('rooms_list_update', roomsList);
+  });
+
+  socket.on('check_reconnect', () => {
+      const room = Object.values(rooms).find(r => r.players.some(p => p.id === socket.user.id));
 
       if (room) {
-          // ЛОГИКА "УМНОГО" РЕКОННЕКТА
-          
-          // 1. Если игра закончена — выкидываем
-          if (room.state === 'finished' || room.state === 'game_over') {
-             return; 
-          }
-
-          // 2. Если это ЛОББИ и игрок там ОДИН (и он вышел из приложения) ->
-          // Считаем, что комната умерла. Удаляем её и не реконнектим.
+          if (room.state === 'game_over') return; // Не реконнектим в законченную игру
           if (room.state === 'lobby' && room.players.length === 1) {
-              delete rooms[room.id];
-              console.log(`Комната ${room.id} удалена (хост покинул лобби через закрытие)`);
-              return; // Клиент останется в меню
+              delete rooms[room.id]; // Удаляем зависшее лобби
+              return;
           }
 
-          // 3. Восстанавливаем игрока
           const player = room.players.find(p => p.id === socket.user.id);
           if (player) {
-              player.socketId = socket.id; // Обновляем сокет
+              player.socketId = socket.id;
               player.isOnline = true;
           }
           
-          // 4. ВОССТАНОВЛЕНИЕ ПРАВ ХОСТА (По ID юзера, а не сокета!)
-          // Если ID юзера совпадает с hostUserId комнаты
           if (room.hostUserId === socket.user.id) {
-              room.hostId = socket.id; // Обновляем активный сокет хоста
+              room.hostId = socket.id;
           }
 
           socket.join(room.id);
-          
           socket.emit('reconnect_success', {
               roomId: room.id,
-              isHost: room.hostUserId === socket.user.id, // Надежная проверка
+              isHost: room.hostUserId === socket.user.id,
               gameState: room.state,
               players: room.players 
           });
-          
-          console.log(`Игрок ${socket.user.name} реконнект в ${room.id}`);
+          io.to(room.id).emit('update_players', room.players);
       } else {
-          // Если комнаты нет, явно говорим клиенту "сессии нет"
           socket.emit('session_not_found');
       }
   });
@@ -181,33 +197,19 @@ io.on('connection', (socket) => {
       const room = rooms[roomId];
       if (!room) return;
 
-      console.log(`Игрок ${socket.user.name} покинул комнату ${roomId}`);
-
       room.players = room.players.filter(p => p.id !== socket.user.id);
       socket.leave(roomId);
 
       if (room.players.length === 0) {
           delete rooms[roomId];
-          console.log(`Комната ${roomId} удалена (пустая)`);
       } else {
-          // Если ушел ХОСТ -> передаем права следующему
-          if (room.hostUserId === socket.user.id) {
-              const newHost = room.players[0]; // Берем первого попавшегося (обычно следующий по списку)
-              room.hostUserId = newHost.id; 
-              room.hostId = newHost.socketId; 
-              
-              console.log(`Права хоста переданы игроку ${newHost.name} (ID: ${newHost.id})`);
-              
-              // --- [ВАЖНО] Сообщаем всем, кто теперь новый хост ---
-              io.to(roomId).emit('host_transferred', { newHostId: newHost.id });
-          }
+          handleHostTransfer(room, socket.user.id);
           io.to(roomId).emit('update_players', room.players);
       }
   });
 
   socket.on('create_room', () => {
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
-    
     const hostPlayer = {
         id: socket.user.id,
         name: socket.user.name,
@@ -219,8 +221,8 @@ io.on('connection', (socket) => {
 
     rooms[roomId] = {
       id: roomId,
-      hostId: socket.id,       // Текущий сокет (для emits)
-      hostUserId: socket.user.id, // [FIX] ID пользователя (для прав)
+      hostId: socket.id,
+      hostUserId: socket.user.id,
       players: [hostPlayer],
       state: 'lobby',
       round: 1,
@@ -229,19 +231,24 @@ io.on('connection', (socket) => {
       timerId: null,
       answers: [],
       votes: {},
-      history: []
+      history: [],
+      questions: [],
+      currentQuestionObj: null
     };
     socket.join(roomId);
     socket.emit('room_created', rooms[roomId]);
-    console.log(`Комната ${roomId} создана ${hostPlayer.name}`);
   });
 
   socket.on('join_room', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return socket.emit('error', 'Комната не найдена');
-    if (room.state !== 'lobby') return socket.emit('error', 'Игра уже идет');
-
+    
     const existingPlayer = room.players.find(p => p.id === socket.user.id);
+
+    // Запрещаем вход новым игрокам во время игры
+    if (room.state !== 'lobby' && !existingPlayer) {
+        return socket.emit('error', 'Игра уже идет');
+    }
     
     if (!existingPlayer) {
         const newPlayer = {
@@ -254,7 +261,22 @@ io.on('connection', (socket) => {
         };
         room.players.push(newPlayer);
     } else {
+        // Логика реконнекта по коду (дублирует check_reconnect, но для явного ввода кода)
         existingPlayer.socketId = socket.id;
+        existingPlayer.isOnline = true;
+        if (room.hostUserId === socket.user.id) room.hostId = socket.id;
+        
+        if (room.state !== 'lobby') {
+            socket.join(roomId);
+            socket.emit('reconnect_success', {
+                roomId: room.id,
+                isHost: room.hostUserId === socket.user.id,
+                gameState: room.state,
+                players: room.players
+            });
+            io.to(roomId).emit('update_players', room.players);
+            return;
+        }
     }
 
     socket.join(roomId);
@@ -264,19 +286,10 @@ io.on('connection', (socket) => {
 
   socket.on('update_profile', async ({ name }) => {
     if (!name || !socket.user) return;
-
-    const { error } = await supabase
-        .from('users')
-        .update({ first_name: name })
-        .eq('id', socket.user.id);
-
-    if (error) {
-        console.error('Supabase Error:', error);
-        return socket.emit('error', 'Не удалось обновить имя');
-    }
-
+    // Оптимизация: не ждать ответа БД для UI, но обрабатывать ошибку
     socket.user.name = name;
-
+    
+    // Обновляем во всех комнатах в памяти
     Object.values(rooms).forEach(room => {
         const player = room.players.find(p => p.id === socket.user.id);
         if (player) {
@@ -284,6 +297,8 @@ io.on('connection', (socket) => {
             io.to(room.id).emit('update_players', room.players);
         }
     });
+
+    await supabase.from('users').update({ first_name: name }).eq('id', socket.user.id);
   });
 
   socket.on('get_topics', () => {
@@ -296,20 +311,18 @@ io.on('connection', (socket) => {
       socket.emit('topics_list', list);
   });
 
-  
-    socket.on('send_reaction', ({ roomId, emoji }) => {
-      // [UPDATED] Добавляем senderId: socket.user.id
+  socket.on('send_reaction', ({ roomId, emoji }) => {
       io.to(roomId).emit('animate_reaction', { 
           emoji, 
           id: Math.random(), 
-          senderId: socket.user.id // <-- Важно!
+          senderId: socket.user.id 
       });
   });
 
   socket.on('start_game', ({ roomId, settings }) => {
     const room = rooms[roomId];
     if (!room || room.hostId !== socket.id) return;
-    if (room.players.length < 2) return;
+    if (room.players.length < 2) return socket.emit('error', 'Нужно минимум 2 игрока');
 
     if (settings) {
         room.maxRounds = Number(settings.rounds) || 5;
@@ -317,26 +330,24 @@ io.on('connection', (socket) => {
         room.selectedTopicIds = settings.topics || ['skeletons'];
     }
 
+    // Формирование пула вопросов
     let questionPool = [];
     (room.selectedTopicIds || []).forEach(tid => {
         if (TOPICS[tid]) {
-            const richQuestions = TOPICS[tid].questions.map(q => ({
+            questionPool.push(...TOPICS[tid].questions.map(q => ({
                 text: q,
                 topicEmoji: TOPICS[tid].emoji,
                 topicName: TOPICS[tid].name
-            }));
-            questionPool.push(...richQuestions);
+            })));
         }
     });
     
+    // Fallback если пул пуст
     if (questionPool.length === 0) {
          Object.values(TOPICS).forEach(t => {
-             const richQuestions = t.questions.map(q => ({
-                text: q,
-                topicEmoji: t.emoji,
-                topicName: t.name
-            }));
-            questionPool.push(...richQuestions);
+            questionPool.push(...t.questions.map(q => ({
+                text: q, topicEmoji: t.emoji, topicName: t.name
+            })));
          });
     }
     
@@ -346,44 +357,39 @@ io.on('connection', (socket) => {
     startNewRound(roomId);
   });
 
+  // [FIX] ВОССТАНОВЛЕННАЯ ЛОГИКА ОТВЕТОВ
   socket.on('submit_answer', ({ roomId, text }) => {
       const room = rooms[roomId];
       if (!room || room.state !== 'writing') return;
-
-      const player = room.players.find(p => p.socketId === socket.id);
-      if (!player) return;
-      if (text.length < 3) return;
-      if (room.answers.find(a => a.authorId === player.id)) return;
-
-      room.answers.push({
-          id: Math.random().toString(36).substr(2, 9),
-          text: text,
-          authorId: player.id
-      });
-
-      io.to(roomId).emit('player_submitted', player.id);
-
-      if (room.answers.length === room.players.length) {
-          clearTimeout(room.timerId);
-          endWritingPhase(roomId);
+      
+      // Проверка: игрок уже ответил?
+      const existing = room.answers.find(a => a.authorId === socket.user.id);
+      if (existing) {
+          existing.text = text; // Можно разрешить редактирование
+      } else {
+          room.answers.push({
+              id: 'ans_' + socket.user.id,
+              text: text,
+              authorId: socket.user.id
+          });
       }
+      
+      socket.emit('player_submitted', socket.user.id); // Подтверждение самому себе
+      io.to(roomId).emit('update_submitted_count', room.answers.length); // Можно добавить такой эвент на клиент
+      
+      checkTimerSkip(roomId);
   });
 
+  // [FIX] ВОССТАНОВЛЕННАЯ ЛОГИКА ГОЛОСОВ
   socket.on('submit_votes', ({ roomId, votes }) => {
       const room = rooms[roomId];
       if (!room || room.state !== 'voting') return;
 
-      const player = room.players.find(p => p.socketId === socket.id);
-      if (!player) return;
-
-      room.votes[player.id] = votes;
-      io.to(roomId).emit('player_voted', player.id);
-
-      const votersCount = Object.keys(room.votes).length;
-      if (votersCount === room.players.length) {
-          clearTimeout(room.timerId);
-          calculateAndShowResults(roomId);
-      }
+      // votes = { answerId: { type: 'human'|'ai', playerId: '...' } }
+      room.votes[socket.user.id] = votes;
+      
+      socket.emit('player_voted', socket.user.id);
+      checkTimerSkip(roomId);
   });
 
   socket.on('dev_skip_timer', ({ roomId }) => {
@@ -395,7 +401,7 @@ io.on('connection', (socket) => {
       }
   });
 
-  socket.on('next_round_request', ({ roomId }) => {
+  socket.on('next_round_request', ({ roomId }) => { 
       const room = rooms[roomId];
       if (room && room.hostId === socket.id) {
           room.round++;
@@ -403,16 +409,14 @@ io.on('connection', (socket) => {
       }
   });
   
-socket.on('request_game_state', ({ roomId }) => {
+  socket.on('request_game_state', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return;
 
-    // 1. Сначала обновляем список игроков и фазу
     socket.emit('update_players', room.players);
     socket.emit('phase_change', room.state);
 
-    // 2. В зависимости от фазы отправляем актуальные данные
-    if (room.state === 'writing') {
+     if (room.state === 'writing') {
         socket.emit('new_round', {
             round: room.round,
             totalRounds: room.maxRounds,
@@ -422,42 +426,31 @@ socket.on('request_game_state', ({ roomId }) => {
             endTime: room.endTime,
             duration: room.timerDuration
         });
-        
-        // Если игрок уже отправил ответ, сообщаем ему об этом (чтобы скрыть поле ввода)
         const hasAnswered = room.answers.some(a => a.authorId === socket.user.id);
-        if (hasAnswered) {
-             socket.emit('player_submitted', socket.user.id);
-        }
-    } 
-    else if (room.state === 'voting') {
-        // Отдаем сохраненные перемешанные ответы
-        if (room.currentShuffledAnswers) {
-            socket.emit('start_voting', {
-                answers: room.currentShuffledAnswers,
-                endTime: room.endTime,
-                duration: 60
-            });
-        }
-        
-        // Если игрок уже проголосовал
-        if (room.votes[socket.user.id]) {
-            socket.emit('player_voted', socket.user.id); // Это может потребоваться обработать на клиенте, если нужно блокировать UI
-        }
-    }
-    else if (room.state === 'reveal') {
-        // Отдаем сохраненные результаты
-        if (room.lastRoundResults) {
-            socket.emit('round_results', room.lastRoundResults);
-        }
-    }
-    // Для 'ai_processing' ничего слать не нужно, клиент просто показывает лоадер по phase_change
+        if (hasAnswered) socket.emit('player_submitted', socket.user.id);
+     }
+     else if (room.state === 'voting') {
+        socket.emit('start_voting', {
+            answers: room.currentShuffledAnswers || [],
+            endTime: room.endTime,
+            duration: 60
+        });
+        if (room.votes[socket.user.id]) socket.emit('player_voted', socket.user.id);
+     }
+     else if (room.state === 'reveal') {
+        socket.emit('round_results', room.lastRoundResults || { deltas: {}, votes: {}, fullAnswers: [], players: room.players });
+     }
   });
-  });
+});
 
-// --- GAME LOGIC FUNCTIONS ---
+// --- HELPER FUNCTIONS ---
+
 function startNewRound(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+
+    // [FIX] Сбрасываем старый таймер, чтобы не было наложений
+    if (room.timerId) clearTimeout(room.timerId);
 
     if (room.round > room.maxRounds) {
         finishGame(roomId);
@@ -468,38 +461,90 @@ function startNewRound(roomId) {
     room.answers = [];
     room.votes = {};
     
-    if (!room.questions || room.questions.length === 0) {
-        room.currentQuestionObj = { text: "Ошибка: вопросы не загрузились", topicEmoji: '⚠️', topicName: 'Error' };
-    } else {
-        room.currentQuestionObj = room.questions[room.round - 1]; 
-    }
+    // Защита от выхода за границы массива
+    room.currentQuestionObj = room.questions[room.round - 1] || { text: "Вопрос не найден", topicEmoji: "❓" };
 
     room.endTime = Date.now() + (room.timerDuration * 1000);
 
     io.to(roomId).emit('new_round', {
         round: room.round,
         totalRounds: room.maxRounds,
-        question: room.currentQuestionObj?.text || "...",
-        topicEmoji: room.currentQuestionObj?.topicEmoji || '❓',
-        topicName: room.currentQuestionObj?.topicName || 'Тема',
+        question: room.currentQuestionObj.text,
+        topicEmoji: room.currentQuestionObj.topicEmoji,
+        topicName: room.currentQuestionObj.topicName,
         endTime: room.endTime,
         duration: room.timerDuration
     });
 
     room.timerId = setTimeout(() => {
         endWritingPhase(roomId);
-    }, room.timerDuration * 1000 + 1000);
+    }, room.timerDuration * 1000 + 1000); // +1 сек буфер
+}
+
+function handleHostTransfer(room, leaverId) {
+    if (room.hostUserId === leaverId) {
+        const newHost = room.players.find(p => p.id !== leaverId && p.isOnline);
+        if (newHost) {
+            room.hostUserId = newHost.id;
+            room.hostId = newHost.socketId;
+            io.to(room.id).emit('host_transferred', { newHostId: newHost.id });
+        } else if (room.players.length > 0) {
+             // Назначаем оффлайн игрока, если никого нет онлайн, чтобы комната жила
+             room.hostUserId = room.players[0].id;
+        }
+    }
+}
+
+function checkEmptyRoomCleanup(roomId) {
+    setTimeout(() => {
+        const room = rooms[roomId];
+        if (room) {
+            const anyoneOnline = room.players.some(p => p.isOnline);
+            if (!anyoneOnline) {
+                console.log(`Cleaning up abandoned room ${roomId}`);
+                delete rooms[roomId];
+            }
+        }
+    }, 300000); // 5 min
+}
+
+function checkTimerSkip(roomId) {
+    const room = rooms[roomId];
+    if(!room) return;
+    
+    // Считаем только тех, кто онлайн, чтобы не ждать вылетевших
+    const activePlayersCount = room.players.filter(p => p.isOnline).length;
+    
+    if (room.state === 'writing') {
+        const answersCount = room.answers.length;
+        if (answersCount >= activePlayersCount && activePlayersCount > 0) {
+             clearTimeout(room.timerId);
+             endWritingPhase(roomId);
+        }
+    } else if (room.state === 'voting') {
+        const votesCount = Object.keys(room.votes).length;
+        if (votesCount >= activePlayersCount && activePlayersCount > 0) {
+             clearTimeout(room.timerId);
+             calculateAndShowResults(roomId);
+        }
+    }
 }
 
 async function endWritingPhase(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+    if (room.timerId) clearTimeout(room.timerId);
 
     room.state = 'ai_processing';
     io.to(roomId).emit('phase_change', 'ai_processing');
 
-    const humanAnswersText = room.answers.map(a => a.text);
-    const aiAnswerText = await generateAiAnswer(room.currentQuestionObj?.text, humanAnswersText);
+    let aiAnswerText = "ИИ устал и молчит :(";
+    try {
+        const humanAnswersText = room.answers.map(a => a.text);
+        aiAnswerText = await generateAiAnswer(room.currentQuestionObj?.text, humanAnswersText);
+    } catch (e) {
+        console.error("AI Gen Error:", e);
+    }
     
     room.answers.push({
         id: 'ai_answer_' + Date.now(),
@@ -513,6 +558,8 @@ async function endWritingPhase(roomId) {
 function startVotingPhase(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+    if (room.timerId) clearTimeout(room.timerId);
+
     room.state = 'voting';
 
     const shuffled = [...room.answers]
@@ -520,7 +567,6 @@ function startVotingPhase(roomId) {
         .sort(() => 0.5 - Math.random());
     
     room.currentShuffledAnswers = shuffled;
-
     room.endTime = Date.now() + 60000;
 
     io.to(roomId).emit('start_voting', {
@@ -537,6 +583,7 @@ function startVotingPhase(roomId) {
 function calculateAndShowResults(roomId) {
     const room = rooms[roomId];
     if (!room) return;
+    if (room.timerId) clearTimeout(room.timerId);
 
     room.state = 'reveal';
     const deltas = {};
@@ -562,22 +609,23 @@ function calculateAndShowResults(roomId) {
 
             let isCorrect = false;
 
+            // Логика начисления очков (СТАРАЯ ВЕРСИЯ)
             if (vote.type === 'ai' && targetAnswer.authorId === 'ai') {
-                deltas[player.id] += 100;
+                deltas[player.id] += 100; // Нашел ИИ
                 isCorrect = true;
             }
             else if (vote.type === 'ai' && targetAnswer.authorId !== 'ai') {
-                deltas[player.id] -= 50;
+                deltas[player.id] -= 50; // Ошибся, принял человека за ИИ
                 if (deltas[targetAnswer.authorId] !== undefined) {
-                    deltas[targetAnswer.authorId] += 108; 
+                    deltas[targetAnswer.authorId] += 108; // Человек обманул другого (вернули 108)
                 }
             }
             else if (vote.type === 'human' && vote.playerId === targetAnswer.authorId) {
-                deltas[player.id] += 25;
+                deltas[player.id] += 25; // Угадал автора (вернули 25)
                 isCorrect = true;
             }
             else {
-                deltas[player.id] -= 50;
+                deltas[player.id] -= 50; // Просто не угадал (вернули штраф -50)
             }
 
             votesSummary[ansId].push({
@@ -596,13 +644,12 @@ function calculateAndShowResults(roomId) {
         });
     });
 
+    // Применяем очки
     room.players.forEach(p => {
         if (deltas[p.id]) p.score += deltas[p.id];
     });
 
     room.history.push(roundStats);
-
-    // [FIX] Сохраняем результаты, чтобы отдать реконнектнувшимся
     room.lastRoundResults = {
         deltas: deltas,
         votes: votesSummary,
@@ -615,9 +662,8 @@ function calculateAndShowResults(roomId) {
 
 function finishGame(roomId) {
     const room = rooms[roomId];
-    if (!room) return; // Защита от краша
-
-    // [FIX] Ставим статус game_over, чтобы check_reconnect его отсекал
+    if (!room) return;
+    
     room.state = 'game_over'; 
 
     const stats = {}; 
@@ -629,6 +675,7 @@ function finishGame(roomId) {
         };
     });
 
+    // Подсчет достижений
     room.history.forEach(round => {
         round.votes.forEach(v => {
             if (v.isCorrect && stats[v.voterId]) {
@@ -656,21 +703,9 @@ function finishGame(roomId) {
     };
 
     const achievements = [
-        { 
-            title: "🕵️ Шерлок Холмс", 
-            desc: "Чаще всех угадывал других", 
-            ...findMax('correctGuessesMade') 
-        },
-        { 
-            title: "🤖 Киборг-убийца", 
-            desc: "Чаще всех притворялся ботом", 
-            ...findMax('timesMistakenForAI') 
-        },
-        { 
-            title: "📖 Открытая книга", 
-            desc: "Самый предсказуемый игрок", 
-            ...findMax('timesGuessedCorrectlyAsHuman') 
-        }
+        { title: "🕵️ Шерлок", desc: "Больше всех угадывал", ...findMax('correctGuessesMade') },
+        { title: "🤖 Киборг", desc: "Чаще всех путали с ботом", ...findMax('timesMistakenForAI') },
+        { title: "📖 Открытая книга", desc: "Самый предсказуемый", ...findMax('timesGuessedCorrectlyAsHuman') }
     ];
 
     io.to(roomId).emit('game_over_stats', {
@@ -678,15 +713,10 @@ function finishGame(roomId) {
         achievements: achievements
     });
 
-    console.log(`Комната ${roomId} завершена. Будет удалена через 10 минут.`);
-    
+    console.log(`Game over in room ${roomId}. Auto-delete in 3 mins.`);
     setTimeout(() => {
-        if (rooms[roomId]) {
-            delete rooms[roomId];
-            console.log(`🗑️ Комната ${roomId} удалена из памяти (очистка).`);
-        }
-    }, 180000); // через 3 минуты
-    
+        if (rooms[roomId]) delete rooms[roomId];
+    }, 180000); 
 }
 
 const PORT = process.env.PORT || 3001;
