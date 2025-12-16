@@ -389,10 +389,11 @@ socket.on('submit_answer', ({ roomId, text }) => {
       const room = rooms[roomId];
       if (!room || room.state !== 'voting') return;
 
-      // votes = { answerId: { type: 'human'|'ai', playerId: '...' } }
       room.votes[socket.user.id] = votes;
       
-      socket.emit('player_voted', socket.user.id);
+      // [FIX] Отправляем ВСЕМ в комнате, чтобы загорелась галочка у проголосовавшего
+      io.to(roomId).emit('player_voted', socket.user.id);
+      
       checkTimerSkip(roomId);
   });
 
