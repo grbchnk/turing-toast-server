@@ -358,14 +358,14 @@ io.on('connection', (socket) => {
   });
 
   // [FIX] ВОССТАНОВЛЕННАЯ ЛОГИКА ОТВЕТОВ
-  socket.on('submit_answer', ({ roomId, text }) => {
+socket.on('submit_answer', ({ roomId, text }) => {
       const room = rooms[roomId];
       if (!room || room.state !== 'writing') return;
       
-      // Проверка: игрок уже ответил?
+      // Проверка/Обновление ответа
       const existing = room.answers.find(a => a.authorId === socket.user.id);
       if (existing) {
-          existing.text = text; // Можно разрешить редактирование
+          existing.text = text;
       } else {
           room.answers.push({
               id: 'ans_' + socket.user.id,
@@ -374,8 +374,12 @@ io.on('connection', (socket) => {
           });
       }
       
-      socket.emit('player_submitted', socket.user.id); // Подтверждение самому себе
-      io.to(roomId).emit('update_submitted_count', room.answers.length); // Можно добавить такой эвент на клиент
+      // [FIX] БЫЛО: socket.emit(...) -> видели только мы
+      // [FIX] СТАЛО: io.to(roomId).emit(...) -> видят ВСЕ (галочка + звук)
+      io.to(roomId).emit('player_submitted', socket.user.id);
+      
+      // Обновляем счетчик (для UI)
+      io.to(roomId).emit('update_submitted_count', room.answers.length);
       
       checkTimerSkip(roomId);
   });
