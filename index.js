@@ -133,41 +133,43 @@ io.on('connection', (socket) => {
       }
   });
 
-    socket.on('get_rooms_list', () => {
+socket.on('get_rooms_list', () => {
     const roomsList = Object.values(rooms)
-      // (Опционально) Не показываем пустые комнаты или те, что готовятся к удалению
       .filter(r => r.state !== 'game_over' && r.players.length > 0)
       .map(room => {
-        // Находим имя хоста для красоты
         const hostName = room.players.find(p => p.id === room.hostUserId)?.name || 'Неизвестный';
         
+        // [FIX] Проверяем, находится ли текущий пользователь уже в этой комнате
+        const isMyRoom = room.players.some(p => p.id === socket.user.id);
+
         return {
-          id: room.id,                     // Код комнаты
-          hostName: hostName,              // Кто создал
-          playersCount: room.players.length, // Сколько людей
-          state: room.state,               // 'lobby', 'writing', 'voting' ...
-          round: room.round,               // Текущий раунд
-          maxRounds: room.maxRounds,       // Всего раундов
-          // Если игра идет — показываем тему или вопрос (обрезанный), если лобби — пишем "Ожидание"
+          id: room.id,
+          hostName: hostName,
+          playersCount: room.players.length,
+          state: room.state,
+          round: room.round,
+          maxRounds: room.maxRounds,
           statusText: room.state === 'lobby' 
             ? 'В лобби' 
             : `${room.currentQuestionObj?.topicEmoji || ''} ${room.currentQuestionObj?.topicName || 'Игра идет'}`,
-          isJoinable: room.state === 'lobby' // Флаг для кнопки "Войти" на клиенте
+          isJoinable: room.state === 'lobby',
+          isMyRoom: isMyRoom // [FIX] Отправляем флаг клиенту
         };
       });
 
-    // Отправляем список обратно запросившему
     socket.emit('rooms_list_update', roomsList);
   });
 
-  socket.on('check_reconnect', () => {
+socket.on('check_reconnect', () => {
       const room = Object.values(rooms).find(r => r.players.some(p => p.id === socket.user.id));
 
       if (room) {
-          if (room.state === 'game_over') return; // Не реконнектим в законченную игру
-          if (room.state === 'lobby' && room.players.length === 1) {
-              delete rooms[room.id]; // Удаляем зависшее лобби
-              return;
+          if (room.state === 'game_over') return;
+          // Удаляем лобби-призрак (если там 1 игрок и это лобби)
+          if (room.state === 'lobby' && room.players.length === 1 && !room.players[0].isOnline) {
+             delete rooms[room.id];
+             socket.emit('session_not_found');
+             return;
           }
 
           const player = room.players.find(p => p.id === socket.user.id);
@@ -181,12 +183,9 @@ io.on('connection', (socket) => {
           }
 
           socket.join(room.id);
-          socket.emit('reconnect_success', {
-              roomId: room.id,
-              isHost: room.hostUserId === socket.user.id,
-              gameState: room.state,
-              players: room.players 
-          });
+          
+          // [FIX] Используем новые полные данные
+          socket.emit('reconnect_success', getReconnectData(room, socket.user.id));
           io.to(room.id).emit('update_players', room.players);
       } else {
           socket.emit('session_not_found');
@@ -261,19 +260,14 @@ io.on('connection', (socket) => {
         };
         room.players.push(newPlayer);
     } else {
-        // Логика реконнекта по коду (дублирует check_reconnect, но для явного ввода кода)
         existingPlayer.socketId = socket.id;
         existingPlayer.isOnline = true;
         if (room.hostUserId === socket.user.id) room.hostId = socket.id;
         
         if (room.state !== 'lobby') {
             socket.join(roomId);
-            socket.emit('reconnect_success', {
-                roomId: room.id,
-                isHost: room.hostUserId === socket.user.id,
-                gameState: room.state,
-                players: room.players
-            });
+            // [FIX] Отправляем полные данные
+            socket.emit('reconnect_success', getReconnectData(room, socket.user.id));
             io.to(roomId).emit('update_players', room.players);
             return;
         }
@@ -421,8 +415,9 @@ socket.on('submit_answer', ({ roomId, text }) => {
     socket.emit('update_players', room.players);
     socket.emit('phase_change', room.state);
 
-     if (room.state === 'writing') {
-        socket.emit('new_round', {
+    // [FIX] Всегда отправляем инфо о раунде, если игра не в лобби
+    if (room.state !== 'lobby') {
+         socket.emit('new_round', {
             round: room.round,
             totalRounds: room.maxRounds,
             question: room.currentQuestionObj?.text,
@@ -431,6 +426,15 @@ socket.on('submit_answer', ({ roomId, text }) => {
             endTime: room.endTime,
             duration: room.timerDuration
         });
+    }
+
+    const myExistingAnswer = room.answers.find(a => a.authorId === socket.user.id);
+    if (myExistingAnswer) {
+        socket.emit('restore_my_answer', myExistingAnswer.text);
+    }
+
+    // Далее специфичная логика фаз (как у тебя и было)...
+    if (room.state === 'writing') {
         const hasAnswered = room.answers.some(a => a.authorId === socket.user.id);
         if (hasAnswered) socket.emit('player_submitted', socket.user.id);
      }
@@ -446,6 +450,23 @@ socket.on('submit_answer', ({ roomId, text }) => {
         socket.emit('round_results', room.lastRoundResults || { deltas: {}, votes: {}, fullAnswers: [], players: room.players });
      }
   });
+});
+
+const getReconnectData = (room, userId) => ({
+    roomId: room.id,
+    isHost: room.hostUserId === userId,
+    gameState: room.state,
+    players: room.players,
+    // [FIX] Всегда отправляем данные о текущем раунде, если игра идет
+    roundData: room.state !== 'lobby' ? {
+        round: room.round,
+        maxRounds: room.maxRounds,
+        question: room.currentQuestionObj?.text,
+        topicEmoji: room.currentQuestionObj?.topicEmoji,
+        topicName: room.currentQuestionObj?.topicName,
+        endTime: room.endTime,
+        duration: room.timerDuration
+    } : null
 });
 
 // --- HELPER FUNCTIONS ---
@@ -723,6 +744,8 @@ function finishGame(roomId) {
         if (rooms[roomId]) delete rooms[roomId];
     }, 180000); 
 }
+
+
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
