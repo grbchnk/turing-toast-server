@@ -161,36 +161,39 @@ socket.on('get_rooms_list', () => {
   });
 
 socket.on('check_reconnect', () => {
-      const room = Object.values(rooms).find(r => r.players.some(p => p.id === socket.user.id));
+    const room = Object.values(rooms).find(r => r.players.some(p => p.id === socket.user.id));
 
-      if (room) {
-          if (room.state === 'game_over') return;
-          // Удаляем лобби-призрак (если там 1 игрок и это лобби)
-          if (room.state === 'lobby' && room.players.length === 1 && !room.players[0].isOnline) {
-             delete rooms[room.id];
-             socket.emit('session_not_found');
-             return;
-          }
+    if (room) {
+        // [FIX] Если игра окончена, разрываем связь с комнатой для этого игрока
+        if (room.state === 'game_over') {
+            socket.emit('session_not_found');
+            return;
+        }
 
-          const player = room.players.find(p => p.id === socket.user.id);
-          if (player) {
-              player.socketId = socket.id;
-              player.isOnline = true;
-          }
-          
-          if (room.hostUserId === socket.user.id) {
-              room.hostId = socket.id;
-          }
+        // Удаляем лобби-призрак
+        if (room.state === 'lobby' && room.players.length === 1 && !room.players[0].isOnline) {
+            delete rooms[room.id];
+            socket.emit('session_not_found');
+            return;
+        }
 
-          socket.join(room.id);
-          
-          // [FIX] Используем новые полные данные
-          socket.emit('reconnect_success', getReconnectData(room, socket.user.id));
-          io.to(room.id).emit('update_players', room.players);
-      } else {
-          socket.emit('session_not_found');
-      }
-  });
+        const player = room.players.find(p => p.id === socket.user.id);
+        if (player) {
+            player.socketId = socket.id;
+            player.isOnline = true;
+        }
+        
+        if (room.hostUserId === socket.user.id) {
+            room.hostId = socket.id;
+        }
+
+        socket.join(room.id);
+        socket.emit('reconnect_success', getReconnectData(room, socket.user.id));
+        io.to(room.id).emit('update_players', room.players);
+    } else {
+        socket.emit('session_not_found');
+    }
+});
 
   socket.on('leave_room', ({ roomId }) => {
       const room = rooms[roomId];
@@ -241,6 +244,11 @@ socket.on('check_reconnect', () => {
   socket.on('join_room', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return socket.emit('error', 'Комната не найдена');
+    
+    // [FIX] Запрещаем вход в завершенную игру всем (и новым, и старым)
+    if (room.state === 'game_over') {
+        return socket.emit('error', 'Эта игра уже завершена');
+    }
     
     const existingPlayer = room.players.find(p => p.id === socket.user.id);
 
@@ -401,11 +409,17 @@ socket.on('submit_answer', ({ roomId, text }) => {
   });
 
   socket.on('next_round_request', ({ roomId }) => { 
-      const room = rooms[roomId];
-      if (room && room.hostId === socket.id) {
-          room.round++;
-          startNewRound(roomId);
-      }
+    const room = rooms[roomId];
+    if (room && room.hostId === socket.id) {
+        // [FIX] Не увеличиваем раунд, если мы уже на пределе
+        if (room.round >= room.maxRounds) {
+            finishGame(roomId);
+            return;
+        }
+        
+        room.round++;
+        startNewRound(roomId);
+    }
   });
   
   socket.on('request_game_state', ({ roomId }) => {
