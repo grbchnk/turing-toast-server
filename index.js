@@ -117,18 +117,22 @@ io.on('connection', (socket) => {
               player.isOnline = false;
               io.to(room.id).emit('update_players', room.players); 
 
+              // ЛОГИКА УДАЛЕНИЯ КОМНАТЫ
+              // Проверяем: если ВСЕ игроки оффлайн -> удаляем комнату сразу
+              const onlineCount = room.players.filter(p => p.isOnline).length;
+              if (onlineCount === 0) {
+                  console.log(`Room ${room.id} is empty (all offline). Deleting immediately.`);
+                  delete rooms[room.id];
+                  return; // Дальше код не нужен
+              }
+
+              // Стандартная логика для лобби (если вышел один, но другие есть)
               if (room.state === 'lobby') {
                   room.players = room.players.filter(p => p.id !== player.id);
-                  if (room.players.length === 0) {
-                      delete rooms[room.id];
-                  } else {
-                      handleHostTransfer(room, socket.user.id);
-                      io.to(room.id).emit('update_players', room.players);
-                  }
-              } else {
-                 // В игре не удаляем сразу, ждем реконнекта
-                 checkEmptyRoomCleanup(room.id);
-              }
+                  handleHostTransfer(room, socket.user.id);
+                  io.to(room.id).emit('update_players', room.players);
+              } 
+              // Если игра идет, но кто-то остался онлайн — ничего не удаляем, ждем реконнекта
           }
       }
   });
@@ -211,6 +215,9 @@ socket.on('check_reconnect', () => {
   });
 
   socket.on('create_room', () => {
+    // [FIX] Сначала удаляем игрока из любых старых комнат
+    removePlayerFromActiveRooms(socket.user.id);
+
     const roomId = Math.random().toString(36).substring(2, 7).toUpperCase();
     const hostPlayer = {
         id: socket.user.id,
@@ -244,20 +251,20 @@ socket.on('check_reconnect', () => {
   socket.on('join_room', ({ roomId }) => {
     const room = rooms[roomId];
     if (!room) return socket.emit('error', 'Комната не найдена');
+    if (room.state === 'game_over') return socket.emit('error', 'Эта игра уже завершена');
     
-    // [FIX] Запрещаем вход в завершенную игру всем (и новым, и старым)
-    if (room.state === 'game_over') {
-        return socket.emit('error', 'Эта игра уже завершена');
-    }
-    
-    const existingPlayer = room.players.find(p => p.id === socket.user.id);
+    // Проверяем, сидим ли мы УЖЕ в ЭТОЙ комнате
+    const isAlreadyHere = room.players.some(p => p.id === socket.user.id);
 
-    // Запрещаем вход новым игрокам во время игры
-    if (room.state !== 'lobby' && !existingPlayer) {
-        return socket.emit('error', 'Игра уже идет');
-    }
-    
-    if (!existingPlayer) {
+    if (!isAlreadyHere) {
+        // [FIX] Если мы не в этой комнате, но были в ДРУГОЙ -> удаляем из старой
+        removePlayerFromActiveRooms(socket.user.id);
+        
+        // Проверка: можно ли войти (игра идет?)
+        if (room.state !== 'lobby') {
+            return socket.emit('error', 'Игра уже идет, а вас в списке нет');
+        }
+
         const newPlayer = {
             id: socket.user.id,
             name: socket.user.name,
@@ -267,23 +274,28 @@ socket.on('check_reconnect', () => {
             isOnline: true
         };
         room.players.push(newPlayer);
+        socket.join(roomId);
+        socket.emit('joined_room', room);
+        io.to(roomId).emit('update_players', room.players);
+
     } else {
+        // РЕКОННЕКТ (Мы уже в списке этой комнаты)
+        const existingPlayer = room.players.find(p => p.id === socket.user.id);
         existingPlayer.socketId = socket.id;
         existingPlayer.isOnline = true;
         if (room.hostUserId === socket.user.id) room.hostId = socket.id;
         
+        socket.join(roomId);
+        
         if (room.state !== 'lobby') {
-            socket.join(roomId);
-            // [FIX] Отправляем полные данные
+            // Возвращаем в игру
             socket.emit('reconnect_success', getReconnectData(room, socket.user.id));
-            io.to(roomId).emit('update_players', room.players);
-            return;
+        } else {
+            // Возвращаем в лобби
+            socket.emit('joined_room', room);
         }
+        io.to(roomId).emit('update_players', room.players);
     }
-
-    socket.join(roomId);
-    socket.emit('joined_room', room);
-    io.to(roomId).emit('update_players', room.players);
   });
 
   socket.on('update_profile', async ({ name }) => {
@@ -484,6 +496,29 @@ const getReconnectData = (room, userId) => ({
 });
 
 // --- HELPER FUNCTIONS ---
+
+function removePlayerFromActiveRooms(userId) {
+    Object.values(rooms).forEach(room => {
+        const playerIndex = room.players.findIndex(p => p.id === userId);
+        if (playerIndex !== -1) {
+            // Удаляем игрока из списка
+            room.players.splice(playerIndex, 1);
+            
+            // Если игрок был хостом, передаем права
+            if (room.hostUserId === userId) {
+                handleHostTransfer(room, userId);
+            }
+
+            // Уведомляем оставшихся в той комнате, что игрок исчез
+            io.to(room.id).emit('update_players', room.players);
+
+            // Если комната опустела — удаляем её
+            if (room.players.length === 0) {
+                delete rooms[room.id];
+            }
+        }
+    });
+}
 
 function startNewRound(roomId) {
     const room = rooms[roomId];
